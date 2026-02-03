@@ -105,6 +105,9 @@ class RankingBacktester:
                 continue
 
             key = (atleta_id, tid)
+            if key in precomputed:
+                LOGGER.warning(f"Duplicata ignorada: atleta_id={atleta_id}, tid={tid}")
+                continue
             precomputed[key] = {
                 "features": feats,
                 "pontuacao": float(row["pontuacao"]),
@@ -206,74 +209,58 @@ class RankingBacktester:
         """
         Backtest de uma rodada usando features pré-calculadas.
         """
-        # Separar treino/teste usando features pré-calculadas
-        train_data = []
-        test_data = []
-        
+        OddsCache.clear()
+
+        # Separar treino/teste (guardando tid no treino para formar os grupos corretamente)
+        train_data: list[tuple[int, dict]] = []
+        test_data: list[tuple[int, int, dict]] = []  # (atleta_id, tid, data)
+
         for (atleta_id, tid), data in self._precomputed.items():
             if tid < temporal_id:
-                train_data.append(data)
+                train_data.append((tid, data))
             elif tid == temporal_id:
-                test_data.append(data)
-        
+                test_data.append((atleta_id, tid, data))
+
         if len(train_data) < 500 or len(test_data) < 40:
             return None
 
-        OddsCache.clear()
-
-        # Montar dados de treino
-        features_by_pos = defaultdict(lambda: ([], [], []))
+        # Montar dados de treino (sem iterar self._precomputed de novo)
+        features_by_pos = defaultdict(lambda: ([], [], []))  # feats, targets, groups(tid)
         all_f, all_t, all_g = [], [], []
-        
-        for data in train_data:
+
+        for tid, data in train_data:
             feats = data["features"]
             pos_id = data["posicao_id"]
             pts = data["pontuacao"]
-            
-            # Extrair temporal_id das features (está implícito na chave original)
-            # Precisamos de uma forma de obter o tid - vamos iterar de novo
-            pass
-        
-        # Reconstruir com tid
-        for (atleta_id, tid), data in self._precomputed.items():
-            if tid >= temporal_id:
-                continue
-                
-            feats = data["features"]
-            pos_id = data["posicao_id"]
-            pts = data["pontuacao"]
-            
+
             features_by_pos[pos_id][0].append(feats)
             features_by_pos[pos_id][1].append(pts)
             features_by_pos[pos_id][2].append(tid)
-            
+
             all_f.append(feats)
             all_t.append(pts)
             all_g.append(tid)
-        
+
         if len(all_f) < 500:
             return None
 
         # Treinar modelos (FAST MODE)
         models = PositionModels()
         models.train_all_fast(
-            dict(features_by_pos), 
+            dict(features_by_pos),
             all_f, all_t, all_g,
             global_params=global_params,
             ensemble_seeds=BACKTEST_ENSEMBLE_SEEDS,
             skip_quantiles=True,  # Sem q10/q90 no backtest
         )
 
-        # Previsões para teste
+        # Previsões para teste (usa test_data já separado)
         rows = []
-        for (atleta_id, tid), data in self._precomputed.items():
-            if tid != temporal_id:
-                continue
-                
+        for atleta_id, tid, data in test_data:
             feats = data["features"]
             pos_id = data["posicao_id"]
             pts = data["pontuacao"]
-            
+
             rank_sc, score_pr, p10, p90 = models.predict(pos_id, feats)
 
             rows.append({
@@ -291,7 +278,6 @@ class RankingBacktester:
             return None
 
         dfp = pd.DataFrame(rows)
-
         pred_col = "score_pred" if rank_by == "score" else "rank_score"
 
         def _topk_idx_desc(x: np.ndarray, k: int) -> np.ndarray:
@@ -326,7 +312,6 @@ class RankingBacktester:
             idx_pred = _topk_idx_desc(pred, k)
             idx_oracle = _topk_idx_desc(act, k)
 
-            # Métricas clássicas
             mpos = RankingMetrics.calculate_all(
                 rank_pred=pred,
                 actual=act,
@@ -338,7 +323,6 @@ class RankingBacktester:
                 compute_spearman=False,
             )
 
-            # Métricas práticas
             mean_pick = float(np.mean(act[idx_pred])) if len(idx_pred) else 0.0
             mean_all = float(np.mean(act)) if len(act) else 0.0
             mean_oracle = float(np.mean(act[idx_oracle])) if len(idx_oracle) else 0.0
@@ -410,6 +394,7 @@ class RankingBacktester:
             "metrics_weighted": weighted,
             "metrics_macro": macro,
         }
+
 
     def _aggregate(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not results:

@@ -1492,8 +1492,18 @@ def generate_predictions(
         preco = float(a.get("preco_num", 0.0) or 0.0)
         score = float(score_pr[0])
         rscore = float(rank_sc[0])
-        lo = float(p10[0]) if not np.isnan(p10[0]) else score - 5
-        hi = float(p90[0]) if not np.isnan(p90[0]) else score + 5
+        # Usar NaN ou calcular com base no std do jogador
+        if not np.isnan(p10[0]):
+            lo = float(p10[0])
+        else:
+            player_std = feats.get("player_std", 5.0)
+            lo = score - 1.28 * player_std  # ~10º percentil assumindo normalidade
+
+        if not np.isnan(p90[0]):
+            hi = float(p90[0])
+        else:
+            player_std = feats.get("player_std", 5.0)
+            hi = score + 1.28 * player_std  # ~90º percentil
         iw = hi - lo
 
         preds.append(PlayerPrediction(

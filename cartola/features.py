@@ -287,7 +287,7 @@ class TemporalFeatureEngineer:
         df["_player_home_advantage"] = home_filled - away_filled
         
         # Streak (simplificado - vetorizado)
-        df["_above_mean"] = (df["pontuacao"] > df["_player_mean"].shift(-1)).astype(int)
+        df["_above_mean"] = (df["pontuacao"] > df["_player_mean"]).astype(int)
         df["_player_positive_streak"] = g["_above_mean"].transform(
             lambda s: s.shift(1).rolling(10, min_periods=1).sum()
         ).fillna(0)
@@ -480,7 +480,6 @@ class TemporalFeatureEngineer:
         f["player_home_advantage"] = float(row.get("_player_home_advantage", 0) or 0)
         
         f["player_pos_streak"] = float(row.get("_player_positive_streak", 0) or 0)
-        f["player_neg_streak"] = 0.0
         f["player_positive_streak"] = float(row.get("_player_positive_streak", 0) or 0)
         f["player_consistency"] = float(row.get("_player_consistency", 0.5) or 0.5)
         

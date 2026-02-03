@@ -173,6 +173,13 @@ def _autosize_and_format_sheet(ws, df: pd.DataFrame):
     for c in ["p_clean_sheet", "p_team_scores_2plus"]:
         set_fmt(c, fmt_pct)
 
+def safe_int(v, default=0):
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return default
+        return int(v)
+    except (ValueError, TypeError):
+        return default
 
 def preds_to_df(preds: List[PlayerPrediction]) -> pd.DataFrame:
     rows = []
@@ -201,7 +208,7 @@ def preds_to_df(preds: List[PlayerPrediction]) -> pd.DataFrame:
             "player_last5_mean": p.features.get("player_last5_mean", 0.0),
             "team_avg": p.features.get("team_avg", 0.0),
             "pos_vs_opp_mean": p.features.get("pos_vs_opp_mean", 0.0),
-            "jogos": int(p.features.get("player_games", 0.0)),
+            "jogos": safe_int(p.features.get("player_games"), 0),
         })
 
     df = pd.DataFrame(rows)
