@@ -1,10 +1,11 @@
 """
-CARTOLA EVALUATION - Backtest e Métricas OTIMIZADO v2
+CARTOLA EVALUATION - Backtest e Métricas CORRIGIDO v3
 =====================================================
-Versão otimizada com:
-- Features pré-calculadas uma vez no __init__
-- Usa train_all_fast() para backtest (3 seeds, sem q10/q90)
-- interval_coverage = NaN no backtest (sem conformal)
+Correções:
+1. itertuples() em vez de iterrows() no pré-cálculo
+2. Estruturas indexadas por (atleta_id, temporal_id) para lookup rápido
+3. Checagem apropriada de None/NaN
+4. Métricas calculadas por grupo/rodada
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import pandas as pd
 
 from training_logger import LOGGER, TrainingLogger, POSICOES
 
-from .config import TOP_K_VALUES, decompose_temporal_id, BACKTEST_ENSEMBLE_SEEDS
+from .config import TOP_K_VALUES, decompose_temporal_id, BACKTEST_ENSEMBLE_SEEDS, DEFAULT_K
 from .io import safe_int, parse_bool, ensure_probability_simplex, OddsCache
 from .models import RankingMetrics, PositionModels
 from .features import TemporalFeatureEngineer
@@ -33,8 +34,10 @@ class RankingBacktester:
     """
     Backtest de ranking usando temporal_id para ordenação temporal.
     
-    OTIMIZAÇÃO: Features são pré-calculadas uma vez no __init__
-    para evitar recálculo em cada rodada do backtest.
+    OTIMIZAÇÕES v3:
+    1. Features pré-calculadas com itertuples() (não iterrows())
+    2. Estrutura indexada por (atleta_id, temporal_id) para lookup O(1)
+    3. Checagem apropriada de None/NaN
     """
     
     def __init__(self, df: pd.DataFrame, fe: TemporalFeatureEngineer):
@@ -43,22 +46,54 @@ class RankingBacktester:
         
         # PRÉ-CALCULAR FEATURES para todas as linhas válidas
         LOGGER.info("Pré-calculando features para backtest...")
-        self._precomputed = self._precompute_all_features()
+        self._precomputed: Dict[Tuple[int, int], Dict] = self._precompute_all_features()
         LOGGER.info(f"   ✓ {len(self._precomputed)} registros com features pré-calculadas")
+        
+        # ÍNDICE AUXILIAR: temporal_id -> lista de (atleta_id, posicao_id)
+        self._index_by_tid: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for (atleta_id, tid), data in self._precomputed.items():
+            self._index_by_tid[tid].append((atleta_id, data["posicao_id"]))
 
-    def _extract_probs(self, row: pd.Series) -> Optional[Tuple[float, float, float]]:
-        if "p_team_win" not in row or pd.isna(row.get("p_team_win", np.nan)):
+    def _extract_probs(self, row) -> Optional[Tuple[float, float, float]]:
+        """
+        Extrai probabilidades de uma row (pode ser namedtuple de itertuples).
+        
+        CORREÇÃO: Checagem apropriada de None/NaN.
+        """
+        # Suporta tanto Series quanto namedtuple
+        if hasattr(row, '_asdict'):
+            # É namedtuple de itertuples
+            p_win_val = getattr(row, 'p_team_win', None)
+        else:
+            # É Series de iterrows
+            p_win_val = row.get("p_team_win", None)
+        
+        # CORREÇÃO: Checagem apropriada de None/NaN
+        if p_win_val is None or pd.isna(p_win_val):
             return None
-        p_win = float(row["p_team_win"])
-        p_draw = float(row.get("p_draw", 1 / 3) if not pd.isna(row.get("p_draw", np.nan)) else 1 / 3)
-        p_lose = row.get("p_team_lose", None)
-
-        if p_lose is None or (isinstance(p_lose, float) and np.isnan(p_lose)):
+        
+        p_win = float(p_win_val)
+        
+        if hasattr(row, '_asdict'):
+            p_draw_val = getattr(row, 'p_draw', None)
+            p_lose_val = getattr(row, 'p_team_lose', None)
+            is_home = parse_bool(getattr(row, 'is_home', False))
+        else:
+            p_draw_val = row.get("p_draw", None)
+            p_lose_val = row.get("p_team_lose", None)
+            is_home = parse_bool(row.get("is_home", False))
+        
+        # CORREÇÃO: Checagem apropriada
+        if p_draw_val is None or pd.isna(p_draw_val):
+            p_draw = 1.0 / 3.0
+        else:
+            p_draw = float(p_draw_val)
+        
+        if p_lose_val is None or pd.isna(p_lose_val):
             p_lose = max(0.0, 1.0 - p_win - p_draw)
+        else:
+            p_lose = float(p_lose_val)
 
-        p_lose = float(p_lose)
-
-        is_home = parse_bool(row.get("is_home", False))
         if is_home:
             p_home, p_away = p_win, p_lose
         else:
@@ -69,14 +104,18 @@ class RankingBacktester:
     def _precompute_all_features(self) -> Dict[Tuple[int, int], Dict]:
         """
         Pré-calcula features para TODOS os registros válidos.
-        Retorna dict[( atleta_id, temporal_id)] -> {features, pontuacao, posicao_id, ...}
+        
+        CORREÇÃO: Usa itertuples() em vez de iterrows() (muito mais rápido).
+        
+        Retorna dict[(atleta_id, temporal_id)] -> {features, pontuacao, posicao_id, ...}
         """
-        precomputed = {}
+        precomputed: Dict[Tuple[int, int], Dict] = {}
         
         valid = self.df[(self.df["entrou_em_campo"] == True)].copy()
         total = len(valid)
         
-        for i, (_, row) in enumerate(valid.iterrows()):
+        # CORREÇÃO: itertuples() em vez de iterrows() - ~10x mais rápido
+        for i, row in enumerate(valid.itertuples(index=False)):
             if i % 10000 == 0 and i > 0:
                 LOGGER.debug(f"   Pré-calculando features: {i}/{total}")
             
@@ -87,18 +126,20 @@ class RankingBacktester:
             p_home, p_draw, p_away = probs
             match_odds = OddsCache.get_or_create(p_home, p_draw, p_away)
 
-            atleta_id = safe_int(row["atleta_id"])
-            pos_id = safe_int(row["posicao_id"])
-            clube_id = safe_int(row["clube_id"])
-            opp_id = safe_int(row["opponent_id"])
-            tid = safe_int(row["temporal_id"])
+            # Acesso via getattr para namedtuple
+            atleta_id = safe_int(getattr(row, 'atleta_id', None))
+            pos_id = safe_int(getattr(row, 'posicao_id', None))
+            clube_id = safe_int(getattr(row, 'clube_id', None))
+            opp_id = safe_int(getattr(row, 'opponent_id', None))
+            tid = safe_int(getattr(row, 'temporal_id', None))
             
-            if None in [atleta_id, pos_id, clube_id, opp_id, tid]:
+            # CORREÇÃO: Checagem apropriada de None
+            if atleta_id is None or pos_id is None or clube_id is None or opp_id is None or tid is None:
                 continue
 
             feats = self.fe.calculate_all_features(
                 atleta_id, pos_id, clube_id, opp_id, match_odds, 
-                parse_bool(row.get("is_home", False)), tid
+                parse_bool(getattr(row, 'is_home', False)), tid
             )
             
             if not feats:
@@ -108,23 +149,38 @@ class RankingBacktester:
             if key in precomputed:
                 LOGGER.warning(f"Duplicata ignorada: atleta_id={atleta_id}, tid={tid}")
                 continue
+                
             precomputed[key] = {
                 "features": feats,
-                "pontuacao": float(row["pontuacao"]),
+                "pontuacao": float(getattr(row, 'pontuacao', 0.0)),
                 "posicao_id": int(pos_id),
                 "clube_id": int(clube_id),
                 "opponent_id": int(opp_id),
-                "is_home": parse_bool(row.get("is_home", False)),
+                "is_home": parse_bool(getattr(row, 'is_home', False)),
             }
         
         return precomputed
+
+    def _get_features_for_round(self, tid: int) -> List[Tuple[int, Dict]]:
+        """
+        Retorna features para uma rodada específica.
+        
+        CORREÇÃO: Usa índice pré-calculado para lookup O(1).
+        """
+        result = []
+        for atleta_id, pos_id in self._index_by_tid.get(tid, []):
+            key = (atleta_id, tid)
+            data = self._precomputed.get(key)
+            if data:
+                result.append((atleta_id, data))
+        return result
 
     def run(
         self,
         start_temporal_id: int,
         end_temporal_id: int,
         global_params: Optional[Dict[str, Any]] = None,
-        k_pos: int = 5,
+        k_pos: int = DEFAULT_K,
         rank_by: str = "score",
     ) -> Dict[str, Any]:
         """
@@ -168,7 +224,8 @@ class RankingBacktester:
 
                 temp, rd = decompose_temporal_id(tid)
                 
-                cov_str = f"{cov:.1%}" if not np.isnan(cov) else "N/A"
+                # CORREÇÃO: Checagem apropriada de NaN
+                cov_str = f"{cov:.1%}" if not pd.isna(cov) else "N/A"
                 print(
                     f"   {temp}/R{rd} (tid={tid}): n={r['n']} | "
                     f"NDCG@{k}={nd:.3f} | Hit@{k}={hr:.3f} | "
@@ -203,74 +260,92 @@ class RankingBacktester:
         self,
         temporal_id: int,
         global_params: Optional[Dict[str, Any]] = None,
-        k_pos: int = 5,
+        k_pos: int = DEFAULT_K,
         rank_by: str = "score",
     ) -> Optional[Dict[str, Any]]:
         """
         Backtest de uma rodada usando features pré-calculadas.
         """
-        OddsCache.clear()
-
-        # Separar treino/teste (guardando tid no treino para formar os grupos corretamente)
-        train_data: list[tuple[int, dict]] = []
-        test_data: list[tuple[int, int, dict]] = []  # (atleta_id, tid, data)
-
-        for (atleta_id, tid), data in self._precomputed.items():
-            if tid < temporal_id:
-                train_data.append((tid, data))
-            elif tid == temporal_id:
-                test_data.append((atleta_id, tid, data))
-
-        if len(train_data) < 500 or len(test_data) < 40:
+        # Dados para treino: todos os temporal_id < atual
+        train_data = [
+            (aid, data) 
+            for (aid, tid), data in self._precomputed.items() 
+            if tid < temporal_id
+        ]
+        
+        if len(train_data) < 200:
             return None
 
-        # Montar dados de treino (sem iterar self._precomputed de novo)
-        features_by_pos = defaultdict(lambda: ([], [], []))  # feats, targets, groups(tid)
-        all_f, all_t, all_g = [], [], []
+        # Preparar features de treino
+        features_by_pos = defaultdict(lambda: ([], [], []))
+        all_features, all_targets, all_groups = [], [], []
 
-        for tid, data in train_data:
+        for atleta_id, data in train_data:
             feats = data["features"]
-            pos_id = data["posicao_id"]
             pts = data["pontuacao"]
+            pos_id = data["posicao_id"]
+            
+            # Recuperar temporal_id do dado original
+            # Como train_data vem do _precomputed, precisamos do tid
+            # Vamos iterar diferente
+            pass
 
-            features_by_pos[pos_id][0].append(feats)
-            features_by_pos[pos_id][1].append(pts)
-            features_by_pos[pos_id][2].append(tid)
+        # CORREÇÃO: Iterar corretamente mantendo o tid
+        for (aid, tid), data in self._precomputed.items():
+            if tid >= temporal_id:
+                continue
+                
+            feats = data["features"]
+            pts = data["pontuacao"]
+            pos_id = data["posicao_id"]
+            
+            all_features.append(feats)
+            all_targets.append(pts)
+            all_groups.append(tid)
+            
+            pos_feats, pos_targs, pos_grps = features_by_pos[pos_id]
+            pos_feats.append(feats)
+            pos_targs.append(pts)
+            pos_grps.append(tid)
 
-            all_f.append(feats)
-            all_t.append(pts)
-            all_g.append(tid)
-
-        if len(all_f) < 500:
+        if len(all_features) < 200:
             return None
 
-        # Treinar modelos (FAST MODE)
+        # Treinar modelos (rápido)
         models = PositionModels()
         models.train_all_fast(
-            dict(features_by_pos),
-            all_f, all_t, all_g,
+            features_by_pos=features_by_pos,
+            all_features=all_features,
+            all_targets=all_targets,
+            all_groups=all_groups,
             global_params=global_params,
-            ensemble_seeds=BACKTEST_ENSEMBLE_SEEDS,
-            skip_quantiles=True,  # Sem q10/q90 no backtest
+            skip_quantiles=True,
         )
 
-        # Previsões para teste (usa test_data já separado)
+        # Dados de teste: apenas a rodada atual
+        test_data = self._get_features_for_round(temporal_id)
+        
+        if len(test_data) < 40:
+            return None
+
+        # Preparar predições
         rows = []
-        for atleta_id, tid, data in test_data:
+        for atleta_id, data in test_data:
             feats = data["features"]
             pos_id = data["posicao_id"]
             pts = data["pontuacao"]
 
-            rank_sc, score_pr, p10, p90 = models.predict(pos_id, feats)
+            m = models.get_model(pos_id)
+            Xp = m.prepare_features([feats])
+            rank_score, score_pred, p10, p90 = models.predict(pos_id, Xp)
 
             rows.append({
-                "temporal_id": int(temporal_id),
-                "posicao_id": int(pos_id),
-                "atleta_id": int(atleta_id),
-                "rank_score": float(rank_sc[0]),
-                "score_pred": float(score_pr[0]),
-                "p10": float(p10[0]) if not np.isnan(p10[0]) else np.nan,
-                "p90": float(p90[0]) if not np.isnan(p90[0]) else np.nan,
+                "atleta_id": atleta_id,
+                "posicao_id": pos_id,
+                "rank_score": float(rank_score[0]),
+                "score_pred": float(score_pred[0]),
+                "p10": float(p10[0]) if not pd.isna(p10[0]) else np.nan,
+                "p90": float(p90[0]) if not pd.isna(p90[0]) else np.nan,
                 "actual": float(pts),
             })
 
@@ -368,7 +443,8 @@ class RankingBacktester:
                 if k not in mp:
                     continue
                 val = mp[k]
-                if np.isnan(val):
+                # CORREÇÃO: Checagem apropriada de NaN
+                if pd.isna(val):
                     continue
                 w = float(n_by_pos.get(pos_id, 0))
                 if w <= 0:
@@ -382,7 +458,7 @@ class RankingBacktester:
         for k in keys:
             vals = []
             for mp in metrics_by_pos.values():
-                if k in mp and not np.isnan(mp[k]):
+                if k in mp and not pd.isna(mp[k]):
                     vals.append(float(mp[k]))
             macro[k] = float(np.mean(vals)) if vals else np.nan
 
@@ -390,72 +466,77 @@ class RankingBacktester:
             "temporal_id": int(temporal_id),
             "n": int(len(dfp)),
             "n_by_pos": n_by_pos,
-            "metrics_by_pos": metrics_by_pos,
             "metrics_weighted": weighted,
             "metrics_macro": macro,
+            "metrics_by_pos": metrics_by_pos,
         }
-
 
     def _aggregate(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Agrega resultados de múltiplas rodadas."""
         if not results:
-            return {}
-
-        agg: Dict[str, Any] = {
-            "n_rodadas": int(len(results)),
-            "total": int(sum(r["n"] for r in results)),
-            "overall_weighted": {},
-            "by_pos": {},
-        }
-
-        # Agregado geral
-        overall_keys = set()
-        for r in results:
-            overall_keys.update(r.get("metrics_weighted", {}).keys())
-
-        for k in sorted(overall_keys):
-            vals = [r["metrics_weighted"].get(k, np.nan) for r in results]
-            vals = [v for v in vals if not np.isnan(v)]
-            if not vals:
-                continue
-            agg["overall_weighted"][k] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "min": float(np.min(vals)),
-                "max": float(np.max(vals)),
+            return {
+                "overall_weighted": {},
+                "overall_macro": {},
+                "by_pos": {},
+                "n_rodadas": 0,
+                "total": 0,
             }
 
         # Agregado por posição
-        pos_ids = set()
+        by_pos: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        n_by_pos_total: Dict[int, int] = defaultdict(int)
+
         for r in results:
-            pos_ids.update((r.get("metrics_by_pos") or {}).keys())
+            for pos_id, mp in r.get("metrics_by_pos", {}).items():
+                for metric, val in mp.items():
+                    if not pd.isna(val):
+                        by_pos[pos_id][metric].append(val)
+                n_by_pos_total[pos_id] += r.get("n_by_pos", {}).get(pos_id, 0)
 
-        for pos_id in sorted(pos_ids):
-            per_round = []
-            for r in results:
-                mp = (r.get("metrics_by_pos") or {}).get(pos_id)
-                if mp is not None:
-                    per_round.append(mp)
+        # Média por posição
+        by_pos_mean: Dict[int, Dict[str, float]] = {}
+        for pos_id, metrics in by_pos.items():
+            by_pos_mean[pos_id] = {
+                metric: float(np.mean(vals)) if vals else np.nan
+                for metric, vals in metrics.items()
+            }
+            by_pos_mean[pos_id]["n_total"] = n_by_pos_total[pos_id]
 
-            if not per_round:
-                continue
+        # Agregado global (ponderado por n)
+        all_keys = set()
+        for mp in by_pos_mean.values():
+            all_keys.update(k for k in mp.keys() if k != "n_total")
 
-            keys = set()
-            for mp in per_round:
-                keys.update(mp.keys())
-
-            agg_pos = {}
-            for k in sorted(keys):
-                vals = [mp.get(k, np.nan) for mp in per_round]
-                vals = [v for v in vals if not np.isnan(v)]
-                if not vals:
+        overall_weighted: Dict[str, float] = {}
+        for k in all_keys:
+            num = 0.0
+            den = 0.0
+            for pos_id, mp in by_pos_mean.items():
+                if k not in mp:
                     continue
-                agg_pos[k] = {
-                    "mean": float(np.mean(vals)),
-                    "std": float(np.std(vals)),
-                    "min": float(np.min(vals)),
-                    "max": float(np.max(vals)),
-                }
+                val = mp[k]
+                if pd.isna(val):
+                    continue
+                w = float(n_by_pos_total.get(pos_id, 0))
+                if w <= 0:
+                    continue
+                num += w * float(val)
+                den += w
+            overall_weighted[k] = (num / den) if den > 0 else np.nan
 
-            agg["by_pos"][int(pos_id)] = agg_pos
+        # Macro (média simples)
+        overall_macro: Dict[str, float] = {}
+        for k in all_keys:
+            vals = []
+            for mp in by_pos_mean.values():
+                if k in mp and not pd.isna(mp[k]):
+                    vals.append(float(mp[k]))
+            overall_macro[k] = float(np.mean(vals)) if vals else np.nan
 
-        return agg
+        return {
+            "overall_weighted": overall_weighted,
+            "overall_macro": overall_macro,
+            "by_pos": by_pos_mean,
+            "n_rodadas": len(results),
+            "total": sum(r.get("n", 0) for r in results),
+        }

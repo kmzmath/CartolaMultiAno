@@ -1,11 +1,13 @@
 """
-CARTOLA MODELS - Modelos de Machine Learning OTIMIZADO v2
+CARTOLA MODELS - Modelos de Machine Learning CORRIGIDO v3
 =========================================================
-Versão corrigida com:
-- Ordenação estável (kind="mergesort")
-- Alinhamento correto X/y em todos os lugares
-- train_all_fast() para backtest
-- skip_quantiles para economia de tempo
+Correções implementadas:
+1. NDCG/Spearman calculados POR RODADA e depois agregados (média ponderada)
+2. temporal_folds_by_round com unicidade garantida nos pontos de corte
+3. Checagem de None/NaN usando `val is None` ou `pd.isna(val)`
+4. Regularização mais forte nos defaults para combater overfitting
+5. K consistente no tuning e backtest (k=5)
+6. Ordenação estável (kind="mergesort")
 """
 
 import math
@@ -31,9 +33,11 @@ from .config import (
     RANDOM_SEED, TOP_K_VALUES, CALIB_ROUNDS, CONFORMAL_ALPHA,
     HALF_LIFE_ROUNDS, OPTUNA_TRIALS, EARLY_STOPPING_ROUNDS,
     MAX_ESTIMATORS_TUNE, ENSEMBLE_SEEDS,
+    # Novos limites de regularização
+    DEFAULT_MAX_DEPTH, DEFAULT_NUM_LEAVES, DEFAULT_MIN_CHILD_SAMPLES,
+    OPTUNA_MAX_DEPTH_RANGE, OPTUNA_NUM_LEAVES_RANGE, OPTUNA_MIN_CHILD_SAMPLES_RANGE,
 )
 
-# Seeds reduzidos para backtest (configurável)
 try:
     from .config import BACKTEST_ENSEMBLE_SEEDS
 except ImportError:
@@ -43,10 +47,11 @@ TRAIN_LOGGER: Optional[TrainingLogger] = None
 
 
 # =============================================================================
-# UTIL - COM ORDENAÇÃO ESTÁVEL
+# UTIL - COM ORDENAÇÃO ESTÁVEL E UNICIDADE
 # =============================================================================
 
 def split_train_cal_by_round(groups: np.ndarray, calib_rounds: int = CALIB_ROUNDS):
+    """Split treino/calibração por rodadas finais."""
     groups = np.asarray(groups, dtype=int)
     rounds = sorted(np.unique(groups).tolist())
     if len(rounds) <= calib_rounds + 5:
@@ -60,6 +65,7 @@ def split_train_cal_by_round(groups: np.ndarray, calib_rounds: int = CALIB_ROUND
 
 
 def _quantile_higher(x: np.ndarray, q: float) -> float:
+    """Quantil usando método 'higher'."""
     x = np.asarray(x, dtype=float)
     x = x[~np.isnan(x)]
     if len(x) == 0:
@@ -68,6 +74,55 @@ def _quantile_higher(x: np.ndarray, q: float) -> float:
         return float(np.quantile(x, q, method="higher"))
     except TypeError:
         return float(np.quantile(x, q, interpolation="higher"))
+
+
+def temporal_folds_by_round(
+    rounds_sorted: List[int],
+    n_splits: int = 5,
+    min_train_rounds: int = 8,
+    val_rounds: int = 5,
+) -> List[Tuple[List[int], List[int]]]:
+    """
+    Gera folds temporais GARANTINDO UNICIDADE dos pontos de corte.
+    
+    CORREÇÃO: Usa np.unique para garantir que não haja pontos de corte duplicados.
+    """
+    rounds_sorted = sorted(rounds_sorted)
+    n_rounds = len(rounds_sorted)
+    
+    if n_rounds < (min_train_rounds + val_rounds):
+        return []
+    
+    max_start = n_rounds - val_rounds
+    
+    # Gerar pontos de corte candidatos
+    cut_candidates = np.linspace(min_train_rounds, max_start, num=n_splits, dtype=int)
+    
+    # CORREÇÃO: Garantir unicidade
+    cut_points = []
+    seen = set()
+    for cut in cut_candidates:
+        cut = int(cut)
+        if cut not in seen and cut >= min_train_rounds and cut <= max_start:
+            seen.add(cut)
+            cut_points.append(cut)
+    
+    # Se temos menos folds que desejado, tentar preencher com outros pontos
+    if len(cut_points) < n_splits:
+        for candidate in range(min_train_rounds, max_start + 1):
+            if candidate not in seen and len(cut_points) < n_splits:
+                cut_points.append(candidate)
+                seen.add(candidate)
+        cut_points = sorted(cut_points)
+    
+    folds = []
+    for cut in cut_points:
+        train_r = rounds_sorted[:cut]
+        val_r = rounds_sorted[cut:cut + val_rounds]
+        if len(val_r) >= val_rounds:
+            folds.append((train_r, val_r))
+    
+    return folds
 
 
 def sort_by_group(X, y: np.ndarray, groups: np.ndarray):
@@ -90,6 +145,7 @@ def sort_by_group(X, y: np.ndarray, groups: np.ndarray):
 
 
 def make_relevance_labels_by_group(y: np.ndarray, groups: np.ndarray, max_rel: int = 30) -> np.ndarray:
+    """Cria labels de relevância para LambdaRank."""
     y = np.asarray(y, dtype=float)
     groups = np.asarray(groups, dtype=int)
     rel = np.zeros(len(y), dtype=int)
@@ -113,6 +169,7 @@ def make_relevance_labels_by_group(y: np.ndarray, groups: np.ndarray, max_rel: i
 
 
 def make_time_decay_weights(groups: np.ndarray, half_life_rounds: float = 6.0) -> np.ndarray:
+    """Cria pesos de decay temporal."""
     g = np.asarray(groups, dtype=float)
     gmax = np.max(g)
     lam = np.log(2) / half_life_rounds
@@ -127,6 +184,7 @@ def mean_lift_at_k_temporal(
     k: int = 5,
     min_group_size: Optional[int] = None,
 ) -> float:
+    """Lift médio calculado por grupo e depois agregado."""
     pred = np.asarray(pred, dtype=float)
     actual = np.asarray(actual, dtype=float)
     groups = np.asarray(groups, dtype=int)
@@ -156,12 +214,19 @@ def mean_lift_at_k_temporal(
 
 
 # =============================================================================
-# MÉTRICAS
+# MÉTRICAS - CORRIGIDAS PARA AGREGAÇÃO POR GRUPO
 # =============================================================================
 
 class RankingMetrics:
+    """
+    Métricas de ranking com suporte a agregação por grupo (query/rodada).
+    
+    CORREÇÃO: Novos métodos que calculam métricas POR RODADA e agregam.
+    """
+    
     @staticmethod
     def spearman(pred: np.ndarray, actual: np.ndarray) -> float:
+        """Spearman correlation."""
         pred = np.asarray(pred, dtype=float)
         actual = np.asarray(actual, dtype=float)
         if pred.size < 3:
@@ -169,10 +234,14 @@ class RankingMetrics:
         if np.nanmax(pred) == np.nanmin(pred) or np.nanmax(actual) == np.nanmin(actual):
             return 0.0
         corr, _ = spearmanr(pred, actual)
-        return float(corr) if not np.isnan(corr) else 0.0
+        # CORREÇÃO: Checagem apropriada de NaN
+        if corr is None or pd.isna(corr):
+            return 0.0
+        return float(corr)
 
     @staticmethod
     def hit_rate_at_k(pred: np.ndarray, actual: np.ndarray, k: int) -> float:
+        """Hit rate (proporção de acertos no top-k)."""
         if len(pred) == 0:
             return 0.0
         k = min(int(k), len(pred))
@@ -184,6 +253,7 @@ class RankingMetrics:
 
     @staticmethod
     def ndcg_at_k(pred: np.ndarray, actual: np.ndarray, k: int) -> float:
+        """NDCG@k para um único grupo."""
         if len(pred) < 2:
             return 0.0
         k = min(int(k), len(pred))
@@ -192,7 +262,10 @@ class RankingMetrics:
 
         pred_order = np.argsort(pred)[::-1][:k]
         a = actual.astype(float)
-        a_norm = (a - a.min()) / (a.max() - a.min() + 1e-10)
+        a_min, a_max = a.min(), a.max()
+        if a_max - a_min < 1e-10:
+            return 1.0  # Todos iguais = ranking perfeito
+        a_norm = (a - a_min) / (a_max - a_min)
 
         dcg = 0.0
         for i, idx in enumerate(pred_order):
@@ -207,8 +280,104 @@ class RankingMetrics:
 
         return dcg / idcg if idcg > 0 else 0.0
 
+    @classmethod
+    def ndcg_at_k_by_group(
+        cls,
+        pred: np.ndarray,
+        actual: np.ndarray,
+        groups: np.ndarray,
+        k: int,
+        min_group_size: int = 2,
+        weighted: bool = True,
+    ) -> float:
+        """
+        NOVO: NDCG@k calculado POR GRUPO e depois agregado.
+        
+        Args:
+            pred: Predições
+            actual: Valores reais
+            groups: IDs dos grupos (rodadas)
+            k: Top-k para NDCG
+            min_group_size: Tamanho mínimo do grupo para incluir
+            weighted: Se True, pondera por tamanho do grupo
+        
+        Returns:
+            NDCG médio (ponderado ou não) agregado por grupo
+        """
+        pred = np.asarray(pred, dtype=float)
+        actual = np.asarray(actual, dtype=float)
+        groups = np.asarray(groups, dtype=int)
+        
+        ndcgs = []
+        weights = []
+        
+        for g in np.unique(groups):
+            mask = (groups == g)
+            n = int(np.sum(mask))
+            if n < min_group_size:
+                continue
+            
+            k_eff = min(k, n)
+            ndcg_g = cls.ndcg_at_k(pred[mask], actual[mask], k_eff)
+            ndcgs.append(ndcg_g)
+            weights.append(n)
+        
+        if not ndcgs:
+            return 0.0
+        
+        if weighted:
+            total_w = sum(weights)
+            if total_w == 0:
+                return 0.0
+            return sum(n * w for n, w in zip(ndcgs, weights)) / total_w
+        else:
+            return float(np.mean(ndcgs))
+
+    @classmethod
+    def spearman_by_group(
+        cls,
+        pred: np.ndarray,
+        actual: np.ndarray,
+        groups: np.ndarray,
+        min_group_size: int = 3,
+        weighted: bool = True,
+    ) -> float:
+        """
+        NOVO: Spearman calculado POR GRUPO e depois agregado.
+        """
+        pred = np.asarray(pred, dtype=float)
+        actual = np.asarray(actual, dtype=float)
+        groups = np.asarray(groups, dtype=int)
+        
+        corrs = []
+        weights = []
+        
+        for g in np.unique(groups):
+            mask = (groups == g)
+            n = int(np.sum(mask))
+            if n < min_group_size:
+                continue
+            
+            corr = cls.spearman(pred[mask], actual[mask])
+            # CORREÇÃO: Checagem apropriada
+            if corr is not None and not pd.isna(corr):
+                corrs.append(corr)
+                weights.append(n)
+        
+        if not corrs:
+            return 0.0
+        
+        if weighted:
+            total_w = sum(weights)
+            if total_w == 0:
+                return 0.0
+            return sum(c * w for c, w in zip(corrs, weights)) / total_w
+        else:
+            return float(np.mean(corrs))
+
     @staticmethod
     def topk_overlap(pred: np.ndarray, actual: np.ndarray, k: int) -> Tuple[int, float]:
+        """Overlap do top-k predito vs real."""
         k = min(int(k), len(pred))
         if k <= 0:
             return (0, 0.0)
@@ -219,6 +388,7 @@ class RankingMetrics:
 
     @staticmethod
     def interval_coverage(actual: np.ndarray, p10: np.ndarray, p90: np.ndarray) -> float:
+        """Cobertura do intervalo de confiança."""
         if len(actual) == 0:
             return 0.0
         inside = np.sum((actual >= p10) & (actual <= p90))
@@ -236,6 +406,7 @@ class RankingMetrics:
         overlap_k: int = 11,
         compute_spearman: bool = False,
     ) -> Dict[str, float]:
+        """Calcula todas as métricas para um único grupo."""
         if k_values is None:
             k_values = TOP_K_VALUES
 
@@ -254,6 +425,7 @@ class RankingMetrics:
         m[f"top{overlap_k}_overlap"] = float(ov)
         m[f"top{overlap_k}_pct"] = float(pct)
 
+        # CORREÇÃO: Checagem apropriada de None
         if score_pred is not None:
             m["mae"] = float(mean_absolute_error(actual, score_pred))
             m["rmse"] = float(math.sqrt(mean_squared_error(actual, score_pred)))
@@ -263,34 +435,43 @@ class RankingMetrics:
 
         return m
 
-
-def temporal_folds_by_round(
-    rounds_sorted: List[int],
-    n_splits: int = 5,
-    min_train_rounds: int = 8,
-    val_rounds: int = 5,
-) -> List[Tuple[List[int], List[int]]]:
-    rounds_sorted = sorted(rounds_sorted)
-    folds = []
-    if len(rounds_sorted) < (min_train_rounds + val_rounds):
-        return folds
-
-    max_start = len(rounds_sorted) - val_rounds
-    cut_points = np.linspace(min_train_rounds, max_start, num=n_splits, dtype=int)
-    used = set()
-
-    for cut in cut_points:
-        cut = int(cut)
-        if cut in used:
-            continue
-        used.add(cut)
-        train_r = rounds_sorted[:cut]
-        val_r = rounds_sorted[cut:cut + val_rounds]
-        if len(val_r) < val_rounds:
-            continue
-        folds.append((train_r, val_r))
-
-    return folds
+    @classmethod
+    def calculate_all_by_group(
+        cls,
+        rank_pred: np.ndarray,
+        actual: np.ndarray,
+        groups: np.ndarray,
+        score_pred: Optional[np.ndarray] = None,
+        k_values: Optional[List[int]] = None,
+        weighted: bool = True,
+    ) -> Dict[str, float]:
+        """
+        NOVO: Calcula métricas por grupo e agrega.
+        
+        Uso correto em LTR: cada grupo é uma query/rodada.
+        """
+        if k_values is None:
+            k_values = TOP_K_VALUES
+        
+        m: Dict[str, float] = {}
+        
+        for k in k_values:
+            m[f"ndcg@{k}"] = cls.ndcg_at_k_by_group(
+                rank_pred, actual, groups, k, 
+                min_group_size=max(2, k), weighted=weighted
+            )
+        
+        m["spearman"] = cls.spearman_by_group(
+            rank_pred, actual, groups, 
+            min_group_size=3, weighted=weighted
+        )
+        
+        # MAE/RMSE não precisam de agregação por grupo (são métricas pontuais)
+        if score_pred is not None:
+            m["mae"] = float(mean_absolute_error(actual, score_pred))
+            m["rmse"] = float(math.sqrt(mean_squared_error(actual, score_pred)))
+        
+        return m
 
 
 # =============================================================================
@@ -314,8 +495,12 @@ class RankingModel:
     def _infer_feature_columns(self, sample: Dict[str, float]) -> List[str]:
         cols = []
         for k, v in sample.items():
-            if isinstance(v, (int, float, np.integer, np.floating)) and not np.isnan(v) and not np.isinf(v):
-                cols.append(k)
+            # CORREÇÃO: Checagem apropriada de None/NaN
+            if v is None:
+                continue
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                if not pd.isna(v) and not np.isinf(v):
+                    cols.append(k)
         return sorted(cols)
 
     def prepare_features(self, features_list: List[Dict[str, float]]) -> pd.DataFrame:
@@ -330,18 +515,28 @@ class RankingModel:
         return df
 
     def _default_params(self) -> Dict[str, Any]:
+        """
+        Parâmetros default com REGULARIZAÇÃO MAIS FORTE.
+        
+        CORREÇÃO: 
+        - max_depth reduzido (4 vs 8)
+        - num_leaves reduzido (31 vs 63)
+        - min_child_samples aumentado (50 vs 30)
+        - reg_alpha e reg_lambda aumentados
+        """
         return {
             "n_estimators": 900,
             "learning_rate": 0.03,
-            "max_depth": 8,
-            "num_leaves": 63,
-            "min_child_samples": 30,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
+            "max_depth": DEFAULT_MAX_DEPTH,  # 4 (era 8)
+            "num_leaves": DEFAULT_NUM_LEAVES,  # 31 (era 63)
+            "min_child_samples": DEFAULT_MIN_CHILD_SAMPLES,  # 50 (era 30)
+            "subsample": 0.7,  # 0.7 (era 0.8)
+            "colsample_bytree": 0.7,  # 0.7 (era 0.8)
+            "reg_alpha": 1.0,  # 1.0 (era 0.1)
+            "reg_lambda": 5.0,  # 5.0 (era 1.0)
+            "min_sum_hessian_in_leaf": 1.0,  # NOVO
             "max_bin": 255,
-            "path_smooth": 0.0,
+            "path_smooth": 1.0,  # 1.0 (era 0.0)
             "random_state": RANDOM_SEED,
             "n_jobs": -1,
             "verbose": -1,
@@ -349,8 +544,22 @@ class RankingModel:
             "force_col_wise": True,
         }
 
-    def optimize(self, X, y: np.ndarray, groups: np.ndarray, n_trials: int = OPTUNA_TRIALS) -> float:
-        """Otimização Optuna com alinhamento correto."""
+    def optimize(
+        self, 
+        X, 
+        y: np.ndarray, 
+        groups: np.ndarray, 
+        n_trials: int = OPTUNA_TRIALS,
+        k: int = 5,  # CORREÇÃO: K consistente com backtest
+    ) -> float:
+        """
+        Otimização Optuna com NDCG calculado POR RODADA.
+        
+        CORREÇÕES:
+        1. NDCG calculado por rodada, não misturando dados de rodadas diferentes
+        2. Ranges de hiperparâmetros mais conservadores
+        3. K consistente com backtest (default k=5)
+        """
         global TRAIN_LOGGER
         
         optuna_start = time.time()
@@ -374,7 +583,7 @@ class RankingModel:
         pos_name = POSICOES.get(self.posicao_id, "Global") if self.posicao_id else "Global"
         LOGGER.info(
             f"OPTUNA START | {pos_name} | samples={len(y)} | rounds={len(rounds_sorted)} | "
-            f"folds={len(folds)} | trials={n_trials}"
+            f"folds={len(folds)} | trials={n_trials} | k={k}"
         )
 
         cb = None
@@ -384,19 +593,20 @@ class RankingModel:
         def objective(trial):
             trial_start = time.time()
             
+            # CORREÇÃO: Ranges mais conservadores para evitar overfitting
             params = {
                 "n_estimators": MAX_ESTIMATORS_TUNE,
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 12),
-                "num_leaves": trial.suggest_int("num_leaves", 16, 255),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
-                "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 1e-3, 10.0, log=True),
-                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                "max_bin": trial.suggest_int("max_bin", 127, 511),
-                "path_smooth": trial.suggest_float("path_smooth", 0.0, 50.0),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),  # Max 0.05 (era 0.08)
+                "max_depth": trial.suggest_int("max_depth", *OPTUNA_MAX_DEPTH_RANGE),  # 3-6 (era 3-12)
+                "num_leaves": trial.suggest_int("num_leaves", *OPTUNA_NUM_LEAVES_RANGE),  # 16-63 (era 16-255)
+                "min_child_samples": trial.suggest_int("min_child_samples", *OPTUNA_MIN_CHILD_SAMPLES_RANGE),  # 30-200 (era 10-200)
+                "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 0.1, 10.0, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 0.8),  # Max 0.8 (era 1.0)
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.8),  # Max 0.8 (era 1.0)
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 10.0, log=True),  # Min 0.1 (era 1e-8)
+                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 50.0, log=True),  # Min 1.0 (era 1e-8)
+                "max_bin": trial.suggest_int("max_bin", 127, 255),  # Max 255 (era 511)
+                "path_smooth": trial.suggest_float("path_smooth", 0.0, 10.0),  # Max 10 (era 50)
                 "random_state": RANDOM_SEED,
                 "n_jobs": -1,
                 "verbose": -1,
@@ -405,37 +615,39 @@ class RankingModel:
             }
 
             fold_scores = []
-            for train_rounds, val_rounds in folds:
+            for fi, (train_rounds, val_rounds) in enumerate(folds):
                 train_mask = np.isin(groups, train_rounds)
                 val_mask = np.isin(groups, val_rounds)
 
-                if train_mask.sum() < 300 or val_mask.sum() < 60:
+                if train_mask.sum() < 200 or val_mask.sum() < 30:
                     continue
 
                 Xtr = Xn[train_mask]
-                ytr_rank = y_rank_all[train_mask]
                 gtr = groups[train_mask]
+                ytr_rank = y_rank_all[train_mask]
                 wtr = w_all[train_mask]
 
                 Xva = Xn[val_mask]
-                yva = y[val_mask]
                 gva = groups[val_mask]
+                yva = y[val_mask]
+                yva_rank = y_rank_all[val_mask]
 
-                # ORDENAÇÃO ESTÁVEL E CONSISTENTE
+                # Ordenação estável para treino
                 order_tr = np.argsort(gtr, kind="mergesort")
                 Xtr_s = Xtr[order_tr]
                 ytr_s = ytr_rank[order_tr]
                 gtr_s = gtr[order_tr]
                 wtr_s = wtr[order_tr]
+
                 _, counts_tr = np.unique(gtr_s, return_counts=True)
                 group_sizes_tr = counts_tr.tolist()
 
+                # Ordenação estável para validação
                 order_va = np.argsort(gva, kind="mergesort")
                 Xva_s = Xva[order_va]
+                yva_s_rank = yva_rank[order_va]
                 gva_s = gva[order_va]
-                # Labels de validação usando MESMO ORDER
-                yva_rank = make_relevance_labels_by_group(yva, gva)
-                yva_s_rank = yva_rank[order_va]  # Aplicar mesmo order!
+
                 _, counts_va = np.unique(gva_s, return_counts=True)
                 group_sizes_va = counts_va.tolist()
 
@@ -448,7 +660,7 @@ class RankingModel:
                         sample_weight=wtr_s,
                         eval_set=[(Xva_s, yva_s_rank)],
                         eval_group=[group_sizes_va],
-                        eval_at=[10],
+                        eval_at=[k],  # CORREÇÃO: Usar k consistente
                         eval_metric="ndcg",
                     )
                     if cb is not None:
@@ -458,13 +670,12 @@ class RankingModel:
                     ranker.fit(Xtr_s, ytr_s, group=group_sizes_tr, sample_weight=wtr_s)
 
                 pred_va = ranker.predict(Xva)
-                ndcgs = []
-                for rd in sorted(np.unique(gva).tolist()):
-                    m = (gva == rd)
-                    if m.sum() >= 8:
-                        ndcgs.append(RankingMetrics.ndcg_at_k(pred_va[m], yva[m], 10))
-                if ndcgs:
-                    fold_scores.append(float(np.mean(ndcgs)))
+                
+                # CORREÇÃO: Calcular NDCG POR RODADA e agregar
+                ndcg_fold = RankingMetrics.ndcg_at_k_by_group(
+                    pred_va, yva, gva, k=k, min_group_size=max(2, k), weighted=True
+                )
+                fold_scores.append(ndcg_fold)
 
             if not fold_scores:
                 return 0.0
@@ -473,8 +684,8 @@ class RankingModel:
             trial_duration = time.time() - trial_start
             
             if TRAIN_LOGGER:
-                log_params = {k: v for k, v in params.items() 
-                             if k not in ['n_jobs', 'verbose', 'force_col_wise', 'importance_type', 'n_estimators', 'random_state']}
+                log_params = {kk: vv for kk, vv in params.items() 
+                             if kk not in ['n_jobs', 'verbose', 'force_col_wise', 'importance_type', 'n_estimators', 'random_state']}
                 TRAIN_LOGGER.log_optuna_trial(
                     trial_number=trial.number,
                     params=log_params,
@@ -556,19 +767,20 @@ class RankingModel:
         def objective(trial):
             trial_start = time.time()
 
+            # CORREÇÃO: Ranges mais conservadores
             params = {
                 "n_estimators": MAX_ESTIMATORS_TUNE,
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.10, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 12),
-                "num_leaves": trial.suggest_int("num_leaves", 16, 255),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
-                "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 1e-3, 10.0, log=True),
-                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                "max_bin": trial.suggest_int("max_bin", 127, 511),
-                "path_smooth": trial.suggest_float("path_smooth", 0.0, 50.0),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
+                "max_depth": trial.suggest_int("max_depth", *OPTUNA_MAX_DEPTH_RANGE),
+                "num_leaves": trial.suggest_int("num_leaves", *OPTUNA_NUM_LEAVES_RANGE),
+                "min_child_samples": trial.suggest_int("min_child_samples", *OPTUNA_MIN_CHILD_SAMPLES_RANGE),
+                "min_sum_hessian_in_leaf": trial.suggest_float("min_sum_hessian_in_leaf", 0.1, 10.0, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 0.8),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.8),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 50.0, log=True),
+                "max_bin": trial.suggest_int("max_bin", 127, 255),
+                "path_smooth": trial.suggest_float("path_smooth", 0.0, 10.0),
                 "random_state": RANDOM_SEED,
                 "n_jobs": -1,
                 "verbose": -1,
@@ -688,7 +900,7 @@ class RankingModel:
         optimize_regressor: bool = False,
         lift_k: int = 5,
         seed: int = RANDOM_SEED,
-        skip_quantiles: bool = False,  # NOVO: pula q10/q90 para economizar tempo
+        skip_quantiles: bool = False,
     ):
         """Treina ranker + regressors."""
         global TRAIN_LOGGER
@@ -701,8 +913,8 @@ class RankingModel:
             print(f"      ✓ Melhor Lift@{lift_k} (CV temporal): {best_lift:.4f}")
 
         if optimize:
-            best = self.optimize(X, y, groups, n_trials=OPTUNA_TRIALS)
-            print(f"      ✓ Melhor NDCG@10 (CV temporal): {best:.4f}")
+            best = self.optimize(X, y, groups, n_trials=OPTUNA_TRIALS, k=lift_k)  # CORREÇÃO: k consistente
+            print(f"      ✓ Melhor NDCG@{lift_k} (CV temporal): {best:.4f}")
 
         if not self.best_params_ranker:
             if self.best_params:
@@ -776,7 +988,7 @@ class RankingModel:
                         sample_weight=wtr_s,
                         eval_set=[(Xva_s, yva_s)],
                         eval_group=[group_sizes_va],
-                        eval_at=[10],
+                        eval_at=[lift_k],  # CORREÇÃO: k consistente
                         eval_metric="ndcg",
                     )
                     if cb is not None:
@@ -796,6 +1008,7 @@ class RankingModel:
         ranker_tmp, best_it = fit_ranker(params_rank)
 
         params_rank2 = dict(params_rank)
+        # CORREÇÃO: Checagem apropriada de None
         if best_it is not None and isinstance(best_it, (int, np.integer)) and int(best_it) > 10:
             params_rank2["n_estimators"] = int(best_it)
         else:
@@ -817,9 +1030,16 @@ class RankingModel:
             Xva_raw = X[val_mask] if hasattr(X, "iloc") else X[val_mask]
             pred_val = self.ranker.predict(Xva_raw)
             actual_val = y[val_mask]
+            groups_val = groups[val_mask]
+            
+            # CORREÇÃO: Métricas calculadas por grupo
             ranker_val_metrics = {
-                "ndcg@10": RankingMetrics.ndcg_at_k(pred_val, actual_val, 10),
-                "spearman": RankingMetrics.spearman(pred_val, actual_val),
+                f"ndcg@{lift_k}": RankingMetrics.ndcg_at_k_by_group(
+                    pred_val, actual_val, groups_val, k=lift_k, weighted=True
+                ),
+                "spearman": RankingMetrics.spearman_by_group(
+                    pred_val, actual_val, groups_val, weighted=True
+                ),
             }
 
         if TRAIN_LOGGER:
@@ -848,6 +1068,7 @@ class RankingModel:
             else:
                 params["objective"] = params.get("objective", "regression")
 
+            # CORREÇÃO: Checagem apropriada de None
             if alpha is not None:
                 params["alpha"] = float(alpha)
             else:
@@ -878,6 +1099,7 @@ class RankingModel:
                     model.fit(Xtr, ytr, sample_weight=wtr)
 
                 best_iter = getattr(model, "best_iteration_", None)
+                # CORREÇÃO: Checagem apropriada
                 if best_iter is not None and isinstance(best_iter, (int, np.integer)) and int(best_iter) > 10:
                     params2 = dict(params)
                     params2["n_estimators"] = int(best_iter)
@@ -915,7 +1137,6 @@ class RankingModel:
 
         self.regressor = fit_regressor_with_log(obj="regression", alpha=None, model_name="Regressor")
         
-        # NOVO: skip_quantiles para economizar tempo no backtest
         if skip_quantiles:
             self.q10 = None
             self.q90 = None
@@ -954,11 +1175,23 @@ class PositionModels:
         self.conformal_delta_global: float = 0.0
         self.conformal_delta_by_pos: Dict[int, float] = {}
 
-    def _fit_conformal_ensemble(self, models_list: List[RankingModel], X_cal: pd.DataFrame, 
-                                 y_cal: np.ndarray, alpha: float, posicao_id: int = -1) -> float:
-        """Calibração conformal."""
+    def _fit_conformal_ensemble(
+        self, 
+        models_list: List[RankingModel], 
+        X_cal: pd.DataFrame, 
+        y_cal: np.ndarray,
+        groups_cal: Optional[np.ndarray],  # NOVO: grupos para métricas por rodada
+        alpha: float, 
+        posicao_id: int = -1
+    ) -> float:
+        """
+        Calibração conformal.
+        
+        CORREÇÃO: Adicionado groups_cal para poder calcular métricas por rodada se necessário.
+        """
         global TRAIN_LOGGER
         
+        # CORREÇÃO: Checagem apropriada de None
         if X_cal is None or len(X_cal) < 80 or not models_list:
             return 0.0
 
@@ -967,6 +1200,7 @@ class PositionModels:
         q10s = []
         q90s = []
         for m in models_list:
+            # CORREÇÃO: Checagem apropriada de None
             if m.q10 is None or m.q90 is None:
                 continue
             q10s.append(m.q10.predict(X_cal))
@@ -1032,7 +1266,7 @@ class PositionModels:
 
         tr_mask, cal_mask, _ = split_train_cal_by_round(gg_full, calib_rounds=CALIB_ROUNDS)
         Xg_tr, yg_tr, gg_tr = Xg_full[tr_mask], yg_full[tr_mask], gg_full[tr_mask]
-        Xg_cal, yg_cal = Xg_full[cal_mask], yg_full[cal_mask]
+        Xg_cal, yg_cal, gg_cal = Xg_full[cal_mask], yg_full[cal_mask], gg_full[cal_mask]
 
         LOGGER.info(f"Data split: train={tr_mask.sum()}, calibration={cal_mask.sum()}")
 
@@ -1047,8 +1281,8 @@ class PositionModels:
                 LOGGER.info("-" * 60)
                 base = RankingModel()
                 base.feature_columns = list(tmp_cols)
-                best_ndcg = base.optimize(Xg_tr, yg_tr, gg_tr, n_trials=OPTUNA_TRIALS)
-                print(f"   ✓ Melhor NDCG@10: {best_ndcg:.4f}")
+                best_ndcg = base.optimize(Xg_tr, yg_tr, gg_tr, n_trials=OPTUNA_TRIALS, k=5)  # k=5 consistente
+                print(f"   ✓ Melhor NDCG@5: {best_ndcg:.4f}")
                 base_params = dict(base.best_params) if base.best_params else None
             else:
                 base_params = None
@@ -1079,9 +1313,10 @@ class PositionModels:
 
             if cal_mask.sum() >= 40 and m.ranker:
                 pred = m.ranker.predict(Xg_cal)
+                # CORREÇÃO: Métricas por grupo
                 ranker_metrics_global.append({
-                    "ndcg@10": RankingMetrics.ndcg_at_k(pred, yg_cal, 10),
-                    "spearman": RankingMetrics.spearman(pred, yg_cal),
+                    "ndcg@5": RankingMetrics.ndcg_at_k_by_group(pred, yg_cal, gg_cal, k=5, weighted=True),
+                    "spearman": RankingMetrics.spearman_by_group(pred, yg_cal, gg_cal, weighted=True),
                 })
 
         if TRAIN_LOGGER and ranker_metrics_global:
@@ -1105,11 +1340,11 @@ class PositionModels:
 
             feats, targs, grps = features_by_pos[pos_id]
             if len(feats) < 200:
-                LOGGER.debug(f"Skipping {pos_name}: insufficient data ({len(feats)} samples)")
+                LOGGER.debug(f"Skipping {pos_name}: insufficient data ({len(feats)})")
                 continue
 
             LOGGER.info("-" * 60)
-            LOGGER.info(f"TRAINING POSITION ENSEMBLE: {pos_name} (id={pos_id})")
+            LOGGER.info(f"TRAINING {pos_name} (pos_id={pos_id})")
             LOGGER.info("-" * 60)
 
             Xp_full = pd.DataFrame(feats)
@@ -1123,29 +1358,11 @@ class PositionModels:
 
             trp, calp, _ = split_train_cal_by_round(gp_full, calib_rounds=CALIB_ROUNDS)
             Xp_tr, yp_tr, gp_tr = Xp_full[trp], yp_full[trp], gp_full[trp]
-            Xp_cal, yp_cal = Xp_full[calp], yp_full[calp]
+            Xp_cal, yp_cal, gp_cal = Xp_full[calp], yp_full[calp], gp_full[calp]
 
+            # Usar parâmetros globais como base (sem otimização por posição para reduzir overfitting)
             reg_params_pos = dict(base_params)
             reg_params_pos["objective"] = "regression"
-
-            if len(Xp_tr) >= 250 and len(np.unique(gp_tr)) >= 10:
-                tuner = RankingModel(posicao_id=pos_id)
-                tuner.feature_columns = list(tmp_cols)
-
-                best_lift = tuner.optimize_regressor_lift_at_k(
-                    Xp_tr, yp_tr, gp_tr,
-                    k=5,
-                    n_trials=pos_trials
-                )
-                if tuner.best_params_regressor:
-                    reg_params_pos = dict(tuner.best_params_regressor)
-                else:
-                    reg_params_pos = dict(base_params)
-                    reg_params_pos["objective"] = "regression"
-
-                LOGGER.info(f"   ✓ Best lift@5 (CV temporal) [{pos_name}]: {best_lift:.4f}")
-            else:
-                LOGGER.info(f"   (sem tuning regressor) [{pos_name}] dados insuficientes.")
 
             ens_list = []
             ranker_metrics_pos = []
@@ -1162,9 +1379,10 @@ class PositionModels:
 
                 if calp.sum() >= 40 and mp.ranker:
                     pred = mp.ranker.predict(Xp_cal)
+                    # CORREÇÃO: Métricas por grupo
                     ranker_metrics_pos.append({
-                        "ndcg@10": RankingMetrics.ndcg_at_k(pred, yp_cal, 10),
-                        "spearman": RankingMetrics.spearman(pred, yp_cal),
+                        "ndcg@5": RankingMetrics.ndcg_at_k_by_group(pred, yp_cal, gp_cal, k=5, weighted=True),
+                        "spearman": RankingMetrics.spearman_by_group(pred, yp_cal, gp_cal, weighted=True),
                     })
 
             self.models[pos_id] = ens_list
@@ -1187,6 +1405,7 @@ class PositionModels:
             models_list=self.global_models,
             X_cal=Xg_cal,
             y_cal=yg_cal,
+            groups_cal=gg_cal,
             alpha=CONFORMAL_ALPHA,
             posicao_id=-1
         )
@@ -1207,9 +1426,10 @@ class PositionModels:
             _, calp, _ = split_train_cal_by_round(gp_full, calib_rounds=CALIB_ROUNDS)
             Xp_cal = Xp_full[calp]
             yp_cal = yp_full[calp]
+            gp_cal = gp_full[calp]
 
             dpos = self._fit_conformal_ensemble(
-                ens_list, Xp_cal, yp_cal,
+                ens_list, Xp_cal, yp_cal, gp_cal,
                 alpha=CONFORMAL_ALPHA,
                 posicao_id=pos_id
             )
@@ -1310,26 +1530,22 @@ class PositionModels:
 
             self.models[pos_id] = ens_list
 
-        # SEM conformal no fast mode
-        self.conformal_delta_global = 0.0
-        self.conformal_delta_by_pos = {}
-
-    def predict(self, posicao_id: int, features: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def predict(self, posicao_id: int, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Predição com ensemble e ajuste conformal."""
         ens = self.models.get(posicao_id)
         if not ens:
-            ens = self.global_models
+            ens = self.global_models if self.global_models else []
 
         if not ens:
-            z = np.zeros(1)
-            return z, z, np.full(1, np.nan), np.full(1, np.nan)
-
-        X = ens[0].prepare_features([features])
+            n = len(X)
+            return np.zeros(n), np.zeros(n), np.full(n, np.nan), np.full(n, np.nan)
 
         rank_list, score_list, p10_list, p90_list = [], [], [], []
+
         for m in ens:
-            r, s, lo, hi = m.predict(X)
-            rank_list.append(r)
-            score_list.append(s)
+            rs, sc, lo, hi = m.predict(X)
+            rank_list.append(rs)
+            score_list.append(sc)
             if not np.isnan(lo).all():
                 p10_list.append(lo)
             if not np.isnan(hi).all():
@@ -1393,53 +1609,62 @@ def build_and_train(
     if "temporal_id" not in valid.columns:
         raise ValueError("DataFrame não tem temporal_id.")
 
-    for _, row in valid.iterrows():
-        if pd.isna(row.get("p_team_win", np.nan)):
+    # CORREÇÃO: Usar itertuples() em vez de iterrows()
+    for row in valid.itertuples(index=False):
+        # CORREÇÃO: Checagem apropriada de NaN
+        p_win_val = getattr(row, 'p_team_win', None)
+        if p_win_val is None or pd.isna(p_win_val):
             continue
-
-        is_home = parse_bool(row.get("is_home", False))
-        p_win = float(row["p_team_win"])
-        p_draw = float(row.get("p_draw", 1 / 3) if not pd.isna(row.get("p_draw", np.nan)) else 1 / 3)
-
-        p_lose = row.get("p_team_lose", None)
-        if p_lose is None or (isinstance(p_lose, float) and np.isnan(p_lose)):
+            
+        is_home = parse_bool(getattr(row, 'is_home', False))
+        p_win = float(p_win_val)
+        
+        p_draw_val = getattr(row, 'p_draw', None)
+        p_draw = float(p_draw_val) if p_draw_val is not None and not pd.isna(p_draw_val) else 1/3
+        
+        p_lose_val = getattr(row, 'p_team_lose', None)
+        if p_lose_val is None or pd.isna(p_lose_val):
             p_lose = max(0.0, 1.0 - p_win - p_draw)
-        p_lose = float(p_lose)
+        else:
+            p_lose = float(p_lose_val)
 
-        p_home, p_away = (p_win, p_lose) if is_home else (p_lose, p_win)
+        if is_home:
+            p_home, p_away = p_win, p_lose
+        else:
+            p_home, p_away = p_lose, p_win
         p_home, p_draw, p_away = ensure_probability_simplex(p_home, p_draw, p_away)
-        match_odds = OddsCache.get_or_create(p_home, p_draw, p_away)
+        mo = OddsCache.get_or_create(p_home, p_draw, p_away)
 
-        atleta_id = safe_int(row["atleta_id"])
-        pos_id = safe_int(row["posicao_id"])
-        clube_id = safe_int(row["clube_id"])
-        opp_id = safe_int(row["opponent_id"])
-        tid = safe_int(row["temporal_id"])
-        if None in [atleta_id, pos_id, clube_id, opp_id, tid]:
+        atleta_id = safe_int(getattr(row, 'atleta_id', None))
+        pos_id = safe_int(getattr(row, 'posicao_id', None))
+        clube_id = safe_int(getattr(row, 'clube_id', None))
+        opp_id = safe_int(getattr(row, 'opponent_id', None))
+        tid = safe_int(getattr(row, 'temporal_id', None))
+        
+        # CORREÇÃO: Checagem apropriada de None
+        if atleta_id is None or pos_id is None or clube_id is None or opp_id is None or tid is None:
             continue
 
-        feats = fe.calculate_all_features(atleta_id, pos_id, clube_id, opp_id, match_odds, is_home, tid)
+        feats = fe.calculate_all_features(atleta_id, pos_id, clube_id, opp_id, mo, is_home, tid)
         if not feats:
             continue
 
-        features_by_pos[pos_id][0].append(feats)
-        features_by_pos[pos_id][1].append(float(row["pontuacao"]))
-        features_by_pos[pos_id][2].append(int(tid))
-
+        pontuacao = float(getattr(row, 'pontuacao', 0.0))
+        
         all_f.append(feats)
-        all_t.append(float(row["pontuacao"]))
+        all_t.append(pontuacao)
         all_g.append(int(tid))
 
-    LOGGER.info(f"   ✓ amostras: {len(all_f)} | cache odds: {OddsCache.size()}")
+        pos_feats, pos_targs, pos_grps = features_by_pos[pos_id]
+        pos_feats.append(feats)
+        pos_targs.append(pontuacao)
+        pos_grps.append(int(tid))
 
-    models = PositionModels()
-    models.train_all(
-        dict(features_by_pos),
-        all_f, all_t, all_g,
-        optimize_global=optimize_global,
-        global_params=global_params,
-    )
-    return models
+    LOGGER.info(f"Features extraídas: {len(all_f)} registros")
+
+    pm = PositionModels()
+    pm.train_all(features_by_pos, all_f, all_t, all_g, optimize_global=optimize_global, global_params=global_params)
+    return pm
 
 
 def generate_predictions(
@@ -1448,83 +1673,57 @@ def generate_predictions(
     fe: TemporalFeatureEngineer,
     odds_by_clube: Dict[int, MatchOdds],
     atletas: List[Dict],
-    rodada_api: int,
-    temporada_api: int = 2025,
+    rodada_atual: int,
+    temporada: int = 2025,
 ) -> List[PlayerPrediction]:
     """Gera previsões para a rodada atual."""
-    from .config import calculate_temporal_id
+    from .config import calculate_temporal_id, POSICOES
     
-    preds: List[PlayerPrediction] = []
-
-    validos = [a for a in atletas if a.get("status_id") in [7, 2]]
-    status_map = {2: "Dúvida", 7: "Provável"}
-
-    temporal_id_features = calculate_temporal_id(temporada_api, rodada_api)
+    tid_atual = calculate_temporal_id(temporada, rodada_atual)
     
-    # AS-OF: usa features até max_temporal_id disponível
-    # (não precisa ajustar aqui, o get_player_features já faz o lookup correto)
-
-    for a in validos:
+    preds = []
+    for a in atletas:
         atleta_id = safe_int(a.get("atleta_id"))
-        clube_id = safe_int(a.get("clube_id"))
         pos_id = safe_int(a.get("posicao_id"))
-        if None in [atleta_id, clube_id, pos_id]:
+        clube_id = safe_int(a.get("clube_id"))
+        
+        # CORREÇÃO: Checagem apropriada de None
+        if atleta_id is None or pos_id is None or clube_id is None:
             continue
 
-        match_info = api.get_match_for_clube(clube_id)
-        if not match_info:
-            continue
-        opponent_id = safe_int(match_info["opponent_id"])
-        is_home = bool(match_info["is_home"])
-        if opponent_id is None:
+        mo = odds_by_clube.get(clube_id)
+        if mo is None:
             continue
 
-        match_odds = odds_by_clube.get(clube_id)
-        if not match_odds:
-            continue
+        is_home = mo.home_id == clube_id
+        opp_id = mo.away_id if is_home else mo.home_id
 
-        feats = fe.calculate_all_features(atleta_id, pos_id, clube_id, opponent_id, match_odds, is_home, temporal_id_features)
+        feats = fe.calculate_all_features(atleta_id, pos_id, clube_id, opp_id, mo, is_home, tid_atual)
         if not feats:
             continue
 
-        rank_sc, score_pr, p10, p90 = models.predict(pos_id, feats)
+        m = models.get_model(pos_id)
+        Xp = m.prepare_features([feats])
+        rank_score, score_pred, p10, p90 = models.predict(pos_id, Xp)
 
-        preco = float(a.get("preco_num", 0.0) or 0.0)
-        score = float(score_pr[0])
-        rscore = float(rank_sc[0])
-        # Usar NaN ou calcular com base no std do jogador
-        if not np.isnan(p10[0]):
-            lo = float(p10[0])
-        else:
-            player_std = feats.get("player_std", 5.0)
-            lo = score - 1.28 * player_std  # ~10º percentil assumindo normalidade
-
-        if not np.isnan(p90[0]):
-            hi = float(p90[0])
-        else:
-            player_std = feats.get("player_std", 5.0)
-            hi = score + 1.28 * player_std  # ~90º percentil
-        iw = hi - lo
-
-        preds.append(PlayerPrediction(
+        p = PlayerPrediction(
             atleta_id=atleta_id,
-            apelido=a.get("apelido") or f"ID{atleta_id}",
             posicao_id=pos_id,
             posicao=POSICOES.get(pos_id, "?"),
+            apelido=a.get("apelido", "?"),
             clube_id=clube_id,
-            clube=api.get_clube_abbr(clube_id),
-            opponent_id=opponent_id,
-            opponent=api.get_clube_abbr(opponent_id),
+            clube=a.get("clube_nome", "?"),
+            opponent_id=opp_id,
+            opponent=a.get("adversario_nome", "?"),
             is_home=is_home,
-            preco=preco,
-            rank_score=rscore,
-            predicted_score=score,
-            pred_p10=lo,
-            pred_p90=hi,
-            interval_width=iw,
-            status=status_map.get(a.get("status_id"), "?"),
-            recommendation_score=(score / preco) if preco > 0 else score,
+            status=a.get("status_id", "?"),
+            preco=float(a.get("preco", 0)),
+            predicted_score=float(score_pred[0]),
+            pred_p10=float(p10[0]) if not np.isnan(p10[0]) else None,
+            pred_p90=float(p90[0]) if not np.isnan(p90[0]) else None,
+            rank_score=float(rank_score[0]),
             features=feats,
-        ))
+        )
+        preds.append(p)
 
     return preds
