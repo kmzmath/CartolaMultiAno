@@ -50,6 +50,26 @@ TRAIN_LOGGER: Optional[TrainingLogger] = None
 # UTIL - COM ORDENAÇÃO ESTÁVEL E UNICIDADE
 # =============================================================================
 
+OLD_FEATURE_COLUMNS = [
+    "player_x_xG",
+    "player_std",
+    "player_mean",
+    "pos_vs_opp_mean",
+    "finisher_x_opp_goals",
+    "scout_positive_ratio",
+    "home_x_player_home",
+    "scout_FS_avg",
+    "player_last5_mean",
+    "opp_concedes_G",
+    "scout_A_avg",
+    "profile_finisher",
+    "opp_concedes_SG",
+    "opp_concedes_FS",
+    "opp_concedes_A",
+    "scout_G_avg",
+]
+
+
 def split_train_cal_by_round(groups: np.ndarray, calib_rounds: int = CALIB_ROUNDS):
     """Split treino/calibração por rodadas finais."""
     groups = np.asarray(groups, dtype=int)
@@ -386,14 +406,6 @@ class RankingMetrics:
         overlap = len(top_pred & top_act)
         return overlap, overlap / k
 
-    @staticmethod
-    def interval_coverage(actual: np.ndarray, p10: np.ndarray, p90: np.ndarray) -> float:
-        """Cobertura do intervalo de confiança."""
-        if len(actual) == 0:
-            return 0.0
-        inside = np.sum((actual >= p10) & (actual <= p90))
-        return inside / len(actual)
-
     @classmethod
     def calculate_all(
         cls,
@@ -429,9 +441,6 @@ class RankingMetrics:
         if score_pred is not None:
             m["mae"] = float(mean_absolute_error(actual, score_pred))
             m["rmse"] = float(math.sqrt(mean_squared_error(actual, score_pred)))
-
-        if p10 is not None and p90 is not None:
-            m["interval_coverage"] = float(cls.interval_coverage(actual, p10, p90))
 
         return m
 
@@ -505,7 +514,8 @@ class RankingModel:
 
     def prepare_features(self, features_list: List[Dict[str, float]]) -> pd.DataFrame:
         if not self.feature_columns:
-            self.feature_columns = self._infer_feature_columns(features_list[0])
+            # força o conjunto antigo
+            self.feature_columns = OLD_FEATURE_COLUMNS.copy()
 
         df = pd.DataFrame(features_list)
         for c in self.feature_columns:
@@ -513,6 +523,7 @@ class RankingModel:
                 df[c] = 0.0
         df = df[self.feature_columns].fillna(0.0).replace([np.inf, -np.inf], 0.0)
         return df
+
 
     def _default_params(self) -> Dict[str, Any]:
         """
@@ -1233,6 +1244,8 @@ class PositionModels:
         
         return float(max(delta, 0.0))
 
+    # models.py (dentro da class PositionModels) — substitua o método train_all inteiro por este
+
     def train_all(
         self,
         features_by_pos,
@@ -1241,8 +1254,16 @@ class PositionModels:
         all_groups,
         optimize_global: bool = True,
         global_params: Optional[Dict[str, Any]] = None,
+        optimize_by_pos: bool = False,
+        optuna_trials_by_pos: int = 150,
+        optimize_regressor_by_pos: bool = False,
+        optuna_trials_reg_by_pos: int = 120,
     ):
-        """Treina ensembles completos (global + por posição) + conformal."""
+        """Treina ensembles completos (global + por posição) + conformal.
+
+        Se optimize_by_pos=True, roda Optuna separadamente para cada posição
+        (ranker e, opcionalmente, regressor) usando apenas o split de treino da posição.
+        """
         global TRAIN_LOGGER
 
         LOGGER.info("=" * 80)
@@ -1313,7 +1334,6 @@ class PositionModels:
 
             if cal_mask.sum() >= 40 and m.ranker:
                 pred = m.ranker.predict(Xg_cal)
-                # CORREÇÃO: Métricas por grupo
                 ranker_metrics_global.append({
                     "ndcg@5": RankingMetrics.ndcg_at_k_by_group(pred, yg_cal, gg_cal, k=5, weighted=True),
                     "spearman": RankingMetrics.spearman_by_group(pred, yg_cal, gg_cal, weighted=True),
@@ -1332,7 +1352,10 @@ class PositionModels:
 
         # ENSEMBLES POR POSIÇÃO
         self.models = {}
-        pos_trials = min(OPTUNA_TRIALS, 500)
+
+        # Limites de trials por posição (evita n_trials absurdo)
+        pos_rank_trials = int(max(0, min(optuna_trials_by_pos, OPTUNA_TRIALS))) if optimize_by_pos else 0
+        pos_reg_trials = int(max(0, min(optuna_trials_reg_by_pos, OPTUNA_TRIALS))) if optimize_regressor_by_pos else 0
 
         for pos_id, pos_name in POSICOES.items():
             if pos_id not in features_by_pos:
@@ -1360,9 +1383,35 @@ class PositionModels:
             Xp_tr, yp_tr, gp_tr = Xp_full[trp], yp_full[trp], gp_full[trp]
             Xp_cal, yp_cal, gp_cal = Xp_full[calp], yp_full[calp], gp_full[calp]
 
-            # Usar parâmetros globais como base (sem otimização por posição para reduzir overfitting)
-            reg_params_pos = dict(base_params)
-            reg_params_pos["objective"] = "regression"
+            # === Optuna por posição (ranker) ===
+            pos_ranker_params = dict(base_params)
+            if pos_rank_trials > 0:
+                LOGGER.info(f"OPTUNA POS ({pos_name}) | ranker | trials={pos_rank_trials}")
+                tmp_pos = RankingModel(posicao_id=pos_id)
+                tmp_pos.feature_columns = list(tmp_cols)
+                try:
+                    best_ndcg_pos = tmp_pos.optimize(Xp_tr, yp_tr, gp_tr, n_trials=pos_rank_trials, k=5)
+                    print(f"   ✓ {pos_name} Melhor NDCG@5: {best_ndcg_pos:.4f}")
+                except Exception as e:
+                    LOGGER.exception(f"Optuna por posição falhou ({pos_name}) - mantendo base_params. Erro: {e}")
+                if tmp_pos.best_params:
+                    pos_ranker_params = dict(tmp_pos.best_params)
+
+            # === Optuna por posição (regressor) ===
+            pos_reg_params = dict(pos_ranker_params)
+            pos_reg_params["objective"] = "regression"
+
+            if pos_reg_trials > 0:
+                LOGGER.info(f"OPTUNA POS ({pos_name}) | regressor | trials={pos_reg_trials}")
+                tmp_reg = RankingModel(posicao_id=pos_id)
+                tmp_reg.feature_columns = list(tmp_cols)
+                try:
+                    best_lift = tmp_reg.optimize_regressor_lift_at_k(Xp_tr, yp_tr, gp_tr, k=5, n_trials=pos_reg_trials)
+                    print(f"   ✓ {pos_name} Melhor LIFT@5 (regressor): {best_lift:.4f}")
+                except Exception as e:
+                    LOGGER.exception(f"Optuna regressor por posição falhou ({pos_name}) - mantendo params. Erro: {e}")
+                if getattr(tmp_reg, "best_params_regressor", None):
+                    pos_reg_params = dict(tmp_reg.best_params_regressor)
 
             ens_list = []
             ranker_metrics_pos = []
@@ -1370,16 +1419,15 @@ class PositionModels:
             for seed in ENSEMBLE_SEEDS:
                 mp = RankingModel(posicao_id=pos_id)
                 mp.feature_columns = list(tmp_cols)
-                mp.best_params_ranker = dict(base_params)
-                mp.best_params_regressor = dict(reg_params_pos)
-                mp.best_params = dict(base_params)
+                mp.best_params_ranker = dict(pos_ranker_params)
+                mp.best_params_regressor = dict(pos_reg_params)
+                mp.best_params = dict(pos_ranker_params)
 
                 mp.train(Xp_tr, yp_tr, gp_tr, optimize=False, optimize_regressor=False, seed=seed)
                 ens_list.append(mp)
 
                 if calp.sum() >= 40 and mp.ranker:
                     pred = mp.ranker.predict(Xp_cal)
-                    # CORREÇÃO: Métricas por grupo
                     ranker_metrics_pos.append({
                         "ndcg@5": RankingMetrics.ndcg_at_k_by_group(pred, yp_cal, gp_cal, k=5, weighted=True),
                         "spearman": RankingMetrics.spearman_by_group(pred, yp_cal, gp_cal, weighted=True),
@@ -1438,6 +1486,7 @@ class PositionModels:
         LOGGER.info("=" * 80)
         LOGGER.info("TRAINING COMPLETE")
         LOGGER.info("=" * 80)
+
 
     def train_all_fast(
         self,
@@ -1589,40 +1638,46 @@ from .features import TemporalFeatureEngineer
 from .report import PlayerPrediction
 
 
+# models.py — ajuste mínimo necessário no build_and_train (assinatura + chamada do train_all)
+# (senão a chamada nova no main vai dar TypeError)
+
 def build_and_train(
     df: pd.DataFrame,
     fe: TemporalFeatureEngineer,
     optimize_global: bool,
     global_params: Optional[Dict[str, Any]] = None,
+    optimize_by_pos: bool = False,
+    optuna_trials_by_pos: int = 150,
+    optimize_regressor_by_pos: bool = False,
+    optuna_trials_reg_by_pos: int = 120,
 ) -> PositionModels:
     """Constrói e treina os modelos usando temporal_id como grupo."""
+    from collections import defaultdict
+
     LOGGER.info("Preparando treino final...")
     OddsCache.clear()
 
-    features_by_pos = defaultdict(lambda: ([], [], []))
+    features_by_pos = defaultdict(lambda: ([], [], []))  # <-- necessário
     all_f, all_t, all_g = [], [], []
 
     valid = df[df["entrou_em_campo"] == True].copy()
     if "p_team_win" not in valid.columns:
         raise ValueError("CSV não tem p_team_win.")
-    
     if "temporal_id" not in valid.columns:
         raise ValueError("DataFrame não tem temporal_id.")
 
-    # CORREÇÃO: Usar itertuples() em vez de iterrows()
     for row in valid.itertuples(index=False):
-        # CORREÇÃO: Checagem apropriada de NaN
-        p_win_val = getattr(row, 'p_team_win', None)
+        p_win_val = getattr(row, "p_team_win", None)
         if p_win_val is None or pd.isna(p_win_val):
             continue
-            
-        is_home = parse_bool(getattr(row, 'is_home', False))
+
+        is_home = parse_bool(getattr(row, "is_home", False))
         p_win = float(p_win_val)
-        
-        p_draw_val = getattr(row, 'p_draw', None)
-        p_draw = float(p_draw_val) if p_draw_val is not None and not pd.isna(p_draw_val) else 1/3
-        
-        p_lose_val = getattr(row, 'p_team_lose', None)
+
+        p_draw_val = getattr(row, "p_draw", None)
+        p_draw = float(p_draw_val) if p_draw_val is not None and not pd.isna(p_draw_val) else 1.0 / 3.0
+
+        p_lose_val = getattr(row, "p_team_lose", None)
         if p_lose_val is None or pd.isna(p_lose_val):
             p_lose = max(0.0, 1.0 - p_win - p_draw)
         else:
@@ -1632,16 +1687,16 @@ def build_and_train(
             p_home, p_away = p_win, p_lose
         else:
             p_home, p_away = p_lose, p_win
+
         p_home, p_draw, p_away = ensure_probability_simplex(p_home, p_draw, p_away)
         mo = OddsCache.get_or_create(p_home, p_draw, p_away)
 
-        atleta_id = safe_int(getattr(row, 'atleta_id', None))
-        pos_id = safe_int(getattr(row, 'posicao_id', None))
-        clube_id = safe_int(getattr(row, 'clube_id', None))
-        opp_id = safe_int(getattr(row, 'opponent_id', None))
-        tid = safe_int(getattr(row, 'temporal_id', None))
-        
-        # CORREÇÃO: Checagem apropriada de None
+        atleta_id = safe_int(getattr(row, "atleta_id", None))
+        pos_id = safe_int(getattr(row, "posicao_id", None))
+        clube_id = safe_int(getattr(row, "clube_id", None))
+        opp_id = safe_int(getattr(row, "opponent_id", None))
+        tid = safe_int(getattr(row, "temporal_id", None))
+
         if atleta_id is None or pos_id is None or clube_id is None or opp_id is None or tid is None:
             continue
 
@@ -1649,8 +1704,8 @@ def build_and_train(
         if not feats:
             continue
 
-        pontuacao = float(getattr(row, 'pontuacao', 0.0))
-        
+        pontuacao = float(getattr(row, "pontuacao", 0.0))
+
         all_f.append(feats)
         all_t.append(pontuacao)
         all_g.append(int(tid))
@@ -1663,9 +1718,16 @@ def build_and_train(
     LOGGER.info(f"Features extraídas: {len(all_f)} registros")
 
     pm = PositionModels()
-    pm.train_all(features_by_pos, all_f, all_t, all_g, optimize_global=optimize_global, global_params=global_params)
+    pm.train_all(
+        features_by_pos, all_f, all_t, all_g,
+        optimize_global=optimize_global,
+        global_params=global_params,
+        optimize_by_pos=optimize_by_pos,
+        optuna_trials_by_pos=optuna_trials_by_pos,
+        optimize_regressor_by_pos=optimize_regressor_by_pos,
+        optuna_trials_reg_by_pos=optuna_trials_reg_by_pos,
+    )
     return pm
-
 
 def generate_predictions(
     api: CartolaAPI,
@@ -1676,18 +1738,50 @@ def generate_predictions(
     rodada_atual: int,
     temporada: int = 2025,
 ) -> List[PlayerPrediction]:
-    """Gera previsões para a rodada atual."""
+    """
+    Gera previsões para a rodada atual.
+    Correções:
+      - Preenche clube/adversario via api.clubes (não depende de 'clube_nome' no atleta)
+      - status como string ("Provável"/"Dúvida")
+      - interval_width e recommendation_score preenchidos
+    Otimização:
+      - Predição em batch por posição (bem mais rápido)
+    """
+    from collections import defaultdict
     from .config import calculate_temporal_id, POSICOES
-    
+
     tid_atual = calculate_temporal_id(temporada, rodada_atual)
-    
-    preds = []
+
+    STATUS_ID_TO_NAME = {7: "Provável", 2: "Dúvida"}
+
+    def _club_info(cid: int) -> Dict:
+        # api.clubes geralmente vem com chaves str
+        return (api.clubes.get(str(cid)) or api.clubes.get(cid) or {})
+
+    def _club_label(cid: int) -> str:
+        info = _club_info(cid)
+        ab = (info.get("abreviacao") or "").strip().upper()
+        nome = (info.get("nome_fantasia") or info.get("nome") or "").strip()
+        # escolha 1: abreviação (consistente com Odds/Partidas)
+        if ab:
+            return ab
+        # fallback: nome
+        if nome:
+            return nome
+        # último fallback: id
+        return str(cid)
+
+    feats_by_pos = defaultdict(list)   # pos_id -> list[dict feats]
+    meta_by_pos = defaultdict(list)    # pos_id -> list[dict meta]
+
     for a in atletas:
+        status_id = safe_int(a.get("status_id"))
+        if status_id not in (7, 2):
+            continue
+
         atleta_id = safe_int(a.get("atleta_id"))
         pos_id = safe_int(a.get("posicao_id"))
         clube_id = safe_int(a.get("clube_id"))
-        
-        # CORREÇÃO: Checagem apropriada de None
         if atleta_id is None or pos_id is None or clube_id is None:
             continue
 
@@ -1695,35 +1789,70 @@ def generate_predictions(
         if mo is None:
             continue
 
-        is_home = mo.home_id == clube_id
+        is_home = (mo.home_id == clube_id)
         opp_id = mo.away_id if is_home else mo.home_id
 
         feats = fe.calculate_all_features(atleta_id, pos_id, clube_id, opp_id, mo, is_home, tid_atual)
         if not feats:
             continue
 
+        feats_by_pos[pos_id].append(feats)
+        meta_by_pos[pos_id].append({
+            "atleta_id": atleta_id,
+            "apelido": a.get("apelido", "?"),
+            "clube_id": clube_id,
+            "clube": _club_label(clube_id),
+            "opp_id": opp_id,
+            "opp": _club_label(opp_id),
+            "is_home": bool(is_home),
+            "status": STATUS_ID_TO_NAME.get(status_id, "Outros"),
+            "preco": float(a.get("preco", 0.0) or 0.0),
+        })
+
+    preds: List[PlayerPrediction] = []
+
+    for pos_id, feats_list in feats_by_pos.items():
+        if not feats_list:
+            continue
+
         m = models.get_model(pos_id)
-        Xp = m.prepare_features([feats])
+        Xp = m.prepare_features(feats_list)
+
         rank_score, score_pred, p10, p90 = models.predict(pos_id, Xp)
 
-        p = PlayerPrediction(
-            atleta_id=atleta_id,
-            posicao_id=pos_id,
-            posicao=POSICOES.get(pos_id, "?"),
-            apelido=a.get("apelido", "?"),
-            clube_id=clube_id,
-            clube=a.get("clube_nome", "?"),
-            opponent_id=opp_id,
-            opponent=a.get("adversario_nome", "?"),
-            is_home=is_home,
-            status=a.get("status_id", "?"),
-            preco=float(a.get("preco", 0)),
-            predicted_score=float(score_pred[0]),
-            pred_p10=float(p10[0]) if not np.isnan(p10[0]) else None,
-            pred_p90=float(p90[0]) if not np.isnan(p90[0]) else None,
-            rank_score=float(rank_score[0]),
-            features=feats,
-        )
-        preds.append(p)
+        rank_score = np.asarray(rank_score, dtype=float)
+        score_pred = np.asarray(score_pred, dtype=float)
+        p10 = np.asarray(p10, dtype=float)
+        p90 = np.asarray(p90, dtype=float)
+
+        metas = meta_by_pos[pos_id]
+        for i in range(len(feats_list)):
+            p10i = float(p10[i]) if np.isfinite(p10[i]) else float("nan")
+            p90i = float(p90[i]) if np.isfinite(p90[i]) else float("nan")
+            width = float(p90i - p10i) if (np.isfinite(p10i) and np.isfinite(p90i)) else float("nan")
+
+            sc = float(score_pred[i])
+            rs = float(rank_score[i])
+
+            preds.append(PlayerPrediction(
+                atleta_id=metas[i]["atleta_id"],
+                apelido=metas[i]["apelido"],
+                posicao_id=pos_id,
+                posicao=POSICOES.get(pos_id, "?"),
+                clube_id=metas[i]["clube_id"],
+                clube=metas[i]["clube"],
+                opponent_id=metas[i]["opp_id"],
+                opponent=metas[i]["opp"],
+                is_home=metas[i]["is_home"],
+                preco=metas[i]["preco"],
+                rank_score=rs,
+                predicted_score=sc,
+                pred_p10=p10i,
+                pred_p90=p90i,
+                interval_width=width,
+                status=metas[i]["status"],
+                recommendation_score=sc,  # mantém igual ao score
+                features=feats_list[i],
+            ))
 
     return preds

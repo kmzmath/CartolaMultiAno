@@ -1,13 +1,3 @@
-"""
-CARTOLA EVALUATION - Backtest e Métricas CORRIGIDO v3
-=====================================================
-Correções:
-1. itertuples() em vez de iterrows() no pré-cálculo
-2. Estruturas indexadas por (atleta_id, temporal_id) para lookup rápido
-3. Checagem apropriada de None/NaN
-4. Métricas calculadas por grupo/rodada
-"""
-
 from __future__ import annotations
 import time
 import warnings
@@ -220,17 +210,14 @@ class RankingBacktester:
                 lift = m.get(f"lift@{k}", np.nan)
                 regret = m.get(f"regret@{k}", np.nan)
                 pct = m.get(f"pick_percentile_mean@{k}", np.nan)
-                cov = m.get("interval_coverage", np.nan)
 
                 temp, rd = decompose_temporal_id(tid)
                 
-                # CORREÇÃO: Checagem apropriada de NaN
-                cov_str = f"{cov:.1%}" if not pd.isna(cov) else "N/A"
                 print(
                     f"   {temp}/R{rd} (tid={tid}): n={r['n']} | "
                     f"NDCG@{k}={nd:.3f} | Hit@{k}={hr:.3f} | "
                     f"Lift@{k}={lift:.2f} | Regret@{k}={regret:.2f} | "
-                    f"PctMean@{k}={pct:.1f} | Cobertura={cov_str}"
+                    f"PctMean@{k}={pct:.1f}"
                 )
 
                 if TRAIN_LOGGER:
@@ -266,29 +253,9 @@ class RankingBacktester:
         """
         Backtest de uma rodada usando features pré-calculadas.
         """
-        # Dados para treino: todos os temporal_id < atual
-        train_data = [
-            (aid, data) 
-            for (aid, tid), data in self._precomputed.items() 
-            if tid < temporal_id
-        ]
-        
-        if len(train_data) < 200:
-            return None
-
         # Preparar features de treino
         features_by_pos = defaultdict(lambda: ([], [], []))
         all_features, all_targets, all_groups = [], [], []
-
-        for atleta_id, data in train_data:
-            feats = data["features"]
-            pts = data["pontuacao"]
-            pos_id = data["posicao_id"]
-            
-            # Recuperar temporal_id do dado original
-            # Como train_data vem do _precomputed, precisamos do tid
-            # Vamos iterar diferente
-            pass
 
         # CORREÇÃO: Iterar corretamente mantendo o tid
         for (aid, tid), data in self._precomputed.items():
@@ -313,14 +280,15 @@ class RankingBacktester:
 
         # Treinar modelos (rápido)
         models = PositionModels()
-        models.train_all_fast(
+        models.train_all(
             features_by_pos=features_by_pos,
             all_features=all_features,
             all_targets=all_targets,
             all_groups=all_groups,
+            optimize_global=False,
             global_params=global_params,
-            skip_quantiles=True,
         )
+
 
         # Dados de teste: apenas a rodada atual
         test_data = self._get_features_for_round(temporal_id)
@@ -375,8 +343,6 @@ class RankingBacktester:
             pred = g[pred_col].to_numpy(dtype=float)
             act = g["actual"].to_numpy(dtype=float)
             sp  = g["score_pred"].to_numpy(dtype=float)
-            p10 = g["p10"].to_numpy(dtype=float)
-            p90 = g["p90"].to_numpy(dtype=float)
 
             n = int(len(g))
             n_by_pos[int(pos_id)] = n
@@ -391,8 +357,6 @@ class RankingBacktester:
                 rank_pred=pred,
                 actual=act,
                 score_pred=sp,
-                p10=p10 if not np.isnan(p10).all() else None,
-                p90=p90 if not np.isnan(p90).all() else None,
                 k_values=[k],
                 overlap_k=k,
                 compute_spearman=False,
@@ -472,71 +436,57 @@ class RankingBacktester:
         }
 
     def _aggregate(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Agrega resultados de múltiplas rodadas."""
+        """Agrega resultados de múltiplas rodadas com estatísticas (mean/std/min/max)."""
         if not results:
+            return {"overall_weighted": {}, "overall_macro": {}, "by_pos": {}, "n_rodadas": 0, "total": 0}
+
+        def _stats(vals: List[float]) -> Dict[str, float]:
+            arr = np.asarray(vals, dtype=float) 
+            arr = arr[~np.isnan(arr)]
+            if arr.size == 0:
+                return {"mean": np.nan, "std": np.nan, "min": np.nan, "max": np.nan}
             return {
-                "overall_weighted": {},
-                "overall_macro": {},
-                "by_pos": {},
-                "n_rodadas": 0,
-                "total": 0,
+                "mean": float(arr.mean()),
+                "std": float(arr.std(ddof=0)),
+                "min": float(arr.min()),
+                "max": float(arr.max()),
             }
 
-        # Agregado por posição
-        by_pos: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-        n_by_pos_total: Dict[int, int] = defaultdict(int)
+        overall_weighted_vals = defaultdict(list)
+        overall_macro_vals = defaultdict(list)
+        by_pos_vals = defaultdict(lambda: defaultdict(list))
+        n_by_pos_total = defaultdict(int)
 
         for r in results:
-            for pos_id, mp in r.get("metrics_by_pos", {}).items():
-                for metric, val in mp.items():
-                    if not pd.isna(val):
-                        by_pos[pos_id][metric].append(val)
-                n_by_pos_total[pos_id] += r.get("n_by_pos", {}).get(pos_id, 0)
+            for k, v in (r.get("metrics_weighted") or {}).items():
+                if not pd.isna(v):
+                    overall_weighted_vals[k].append(float(v))
 
-        # Média por posição
-        by_pos_mean: Dict[int, Dict[str, float]] = {}
-        for pos_id, metrics in by_pos.items():
-            by_pos_mean[pos_id] = {
-                metric: float(np.mean(vals)) if vals else np.nan
-                for metric, vals in metrics.items()
-            }
-            by_pos_mean[pos_id]["n_total"] = n_by_pos_total[pos_id]
+            for k, v in (r.get("metrics_macro") or {}).items():
+                if not pd.isna(v):
+                    overall_macro_vals[k].append(float(v))
 
-        # Agregado global (ponderado por n)
-        all_keys = set()
-        for mp in by_pos_mean.values():
-            all_keys.update(k for k in mp.keys() if k != "n_total")
+            for pos_id, mp in (r.get("metrics_by_pos") or {}).items():
+                pos_id = int(pos_id)
+                for k, v in (mp or {}).items():
+                    if not pd.isna(v):
+                        by_pos_vals[pos_id][k].append(float(v))
 
-        overall_weighted: Dict[str, float] = {}
-        for k in all_keys:
-            num = 0.0
-            den = 0.0
-            for pos_id, mp in by_pos_mean.items():
-                if k not in mp:
-                    continue
-                val = mp[k]
-                if pd.isna(val):
-                    continue
-                w = float(n_by_pos_total.get(pos_id, 0))
-                if w <= 0:
-                    continue
-                num += w * float(val)
-                den += w
-            overall_weighted[k] = (num / den) if den > 0 else np.nan
+            for pos_id, n in (r.get("n_by_pos") or {}).items():
+                n_by_pos_total[int(pos_id)] += int(n)
 
-        # Macro (média simples)
-        overall_macro: Dict[str, float] = {}
-        for k in all_keys:
-            vals = []
-            for mp in by_pos_mean.values():
-                if k in mp and not pd.isna(mp[k]):
-                    vals.append(float(mp[k]))
-            overall_macro[k] = float(np.mean(vals)) if vals else np.nan
+        overall_weighted = {k: _stats(v) for k, v in overall_weighted_vals.items()}
+        overall_macro = {k: _stats(v) for k, v in overall_macro_vals.items()}
+
+        by_pos = {}
+        for pos_id, metrics in by_pos_vals.items():
+            by_pos[pos_id] = {k: _stats(v) for k, v in metrics.items()}
+            by_pos[pos_id]["n_total"] = n_by_pos_total.get(pos_id, 0)
 
         return {
             "overall_weighted": overall_weighted,
             "overall_macro": overall_macro,
-            "by_pos": by_pos_mean,
+            "by_pos": by_pos,
             "n_rodadas": len(results),
             "total": sum(r.get("n", 0) for r in results),
         }

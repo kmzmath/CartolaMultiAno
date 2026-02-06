@@ -7,14 +7,14 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
 
-from training_logger import POSICOES
-
-from .config import STATUS_ORD, SHEET_BY_POS
-from .io import PoissonModel, MatchOdds
+from .io import PoissonModel, MatchOdds, safe_int
 
 if TYPE_CHECKING:
     from .models import PositionModels
 
+from .config import STATUS_ORD, SHEET_BY_POS, POSICOES
+
+from pathlib import Path
 
 @dataclass
 class PlayerPrediction:
@@ -65,7 +65,6 @@ def print_backtest(results: Dict[str, Any], k_pos: int = 5):
         f"pick_percentile_median@{k_pos}",
         f"pick_percentile_min@{k_pos}",
         f"pct_picks_above_mean@{k_pos}",
-        "interval_coverage",
         "mae",
         "rmse",
     ]
@@ -91,32 +90,108 @@ def print_backtest(results: Dict[str, Any], k_pos: int = 5):
                     m = mp[k]
                     print(f"{k:<30} {m['mean']:>12.3f} {m['std']:>10.3f} {m['min']:>10.3f} {m['max']:>10.3f}")
 
-    if "interval_coverage" in overall:
-        cov = overall["interval_coverage"]["mean"]
-        if cov < 0.75:
-            print(f"\n⚠️ Cobertura p10-p90 baixa ({cov:.1%}). Intervalos estreitos.")
-        elif cov > 0.90:
-            print(f"\n⚠️ Cobertura p10-p90 alta ({cov:.1%}). Intervalos largos.")
+def _ensemble_importance(ens, top_n: int = 40, kind: str = "ranker"):
+    """
+    kind:
+      - "ranker" -> importance do LGBMRanker (rank_score)
+      - "score"  -> importance do LGBMRegressor (previsao_pontos)
+    Retorna lista [(feature, importance_normalizada), ...] com média no ensemble.
+    """
+    if not ens:
+        return []
+
+    # Define colunas "base" para alinhar (evita bagunça se alguma seed variar)
+    base_cols = getattr(ens[0], "feature_columns", None) or []
+    if not base_cols:
+        return []
+
+    acc = np.zeros(len(base_cols), dtype=float)
+    used = 0
+
+    for m in ens:
+        cols = getattr(m, "feature_columns", None) or []
+        model_obj = getattr(m, "ranker", None) if kind == "ranker" else getattr(m, "regressor", None)
+        if model_obj is None or not cols:
+            continue
+
+        imp = getattr(model_obj, "feature_importances_", None)
+        if imp is None:
+            continue
+
+        imp = np.asarray(imp, dtype=float)
+
+        # Alinha importance nas colunas base (caso a ordem/colunas difiram)
+        if cols != base_cols:
+            idx = {f: i for i, f in enumerate(cols)}
+            aligned = np.zeros(len(base_cols), dtype=float)
+            for i, f in enumerate(base_cols):
+                j = idx.get(f)
+                if j is not None and j < len(imp):
+                    aligned[i] = imp[j]
+            imp = aligned
+
+        s = float(imp.sum())
+        if s <= 0:
+            continue
+
+        acc += imp / s
+        used += 1
+
+    if used == 0:
+        return []
+
+    acc /= used
+    items = list(zip(base_cols, acc))
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items[:top_n]
 
 
-def print_importance(models: PositionModels, top_n: int = 25):
-    print("\n" + "=" * 100)
-    print(" 🎯 FEATURE IMPORTANCE (gain normalizado) - GLOBAL RANKER")
-    print("=" * 100)
+def importance_to_df(models: "PositionModels", top_n: int = 40, kind: str = "ranker", posicao_id: Optional[int] = None) -> pd.DataFrame:
+    """
+    posicao_id=None -> GLOBAL (ensemble global)
+    posicao_id=int  -> importance do ensemble daquela posição (cai no global se não existir)
+    """
+    if posicao_id is None:
+        ens = getattr(models, "global_models", None) or []
+    else:
+        ens = getattr(models, "models", {}).get(posicao_id) or []
+        if not ens:
+            ens = getattr(models, "global_models", None) or []
 
-    if not models.global_model:
-        print("Sem modelo global.")
-        return
-    imp = models.global_model.feature_importance(top_n)
-    if not imp:
-        print("Sem importance disponível.")
-        return
+    imp = _ensemble_importance(ens, top_n=top_n, kind=kind)
+    return pd.DataFrame([{"feature": f, "importance": v} for f, v in imp])
 
-    print(f"\n{'Feature':<40} {'Importância':>15}")
-    print("-" * 55)
-    for feat, v in imp:
-        bar = "█" * int(v * 120)
-        print(f"{feat[:39]:<40} {v:>12.4f}  {bar}")
+
+def print_importance(models: "PositionModels", top_n: int = 25):
+    def _print_block(title: str, df: pd.DataFrame):
+        print("\n" + "=" * 100)
+        print(title)
+        print("=" * 100)
+
+        if df is None or df.empty:
+            print("Sem importance disponível.")
+            return
+
+        print(f"\n{'Feature':<40} {'Importância':>15}")
+        print("-" * 55)
+        for _, row in df.iterrows():
+            feat = str(row["feature"])
+            v = float(row["importance"])
+            bar = "█" * int(v * 120)
+            print(f"{feat[:39]:<40} {v:>12.4f}  {bar}")
+
+    # GLOBAL
+    _print_block(" 🎯 FEATURE IMPORTANCE - GLOBAL (RANKER / rank_score)", importance_to_df(models, top_n=top_n, kind="ranker", posicao_id=None))
+    _print_block(" 🎯 FEATURE IMPORTANCE - GLOBAL (REGRESSOR / previsao_pontos)", importance_to_df(models, top_n=top_n, kind="score", posicao_id=None))
+
+    # POR POSIÇÃO
+    for pos_id in sorted(POSICOES.keys()):
+        pname = POSICOES.get(pos_id, str(pos_id))
+        df_r = importance_to_df(models, top_n=top_n, kind="ranker", posicao_id=pos_id)
+        df_s = importance_to_df(models, top_n=top_n, kind="score", posicao_id=pos_id)
+
+        _print_block(f" 🎯 FEATURE IMPORTANCE - {pname} (RANKER / rank_score)", df_r)
+        _print_block(f" 🎯 FEATURE IMPORTANCE - {pname} (REGRESSOR / previsao_pontos)", df_s)
 
 
 def print_matches(odds_by_clube: Dict[int, MatchOdds]):
@@ -257,61 +332,104 @@ def matches_to_df(odds_by_clube: Dict[int, MatchOdds]) -> pd.DataFrame:
     return df
 
 
-def importance_to_df(models: PositionModels, top_n: int = 40) -> pd.DataFrame:
-    if not models.global_model:
-        return pd.DataFrame(columns=["feature", "importance"])
-    imp = models.global_model.feature_importance(top_n=top_n)
-    return pd.DataFrame([{"feature": f, "importance": v} for f, v in imp])
-
-
 def save_excel(
     preds: List[PlayerPrediction],
     odds_by_clube: Dict[int, MatchOdds],
-    models: PositionModels,
+    models: "PositionModels",
     path: str,
     top_n_resumo: int = 25,
 ):
+    # garante diretório
+    out_path = Path(path)
+    if out_path.parent and str(out_path.parent) not in ("", "."):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
     df_all = preds_to_df(preds)
 
-    resumo_parts = []
+    # =========================
+    # Resumo (top geral + top por posição)
+    # =========================
+    resumo_parts: List[pd.DataFrame] = []
 
-    top_score = df_all.sort_values(["previsao_pontos"], ascending=False).head(top_n_resumo).copy()
-    top_score.insert(0, "lista", f"TOP {top_n_resumo} - Pontos")
-    resumo_parts.append(top_score)
+    if not df_all.empty:
+        top_score = (
+            df_all.sort_values(["previsao_pontos"], ascending=False)
+            .head(top_n_resumo)
+            .copy()
+        )
+        top_score.insert(0, "lista", f"TOP {top_n_resumo} - Pontos")
+        resumo_parts.append(top_score)
 
-    for pos_id, pos_name in POSICOES.items():
-        d = df_all[df_all["posicao_id"] == pos_id].copy()
-        if d.empty:
-            continue
-        t = d.sort_values(["previsao_pontos"], ascending=False).head(top_n_resumo)
-        t.insert(0, "lista", f"{pos_name} - TOP {top_n_resumo} (Pontos)")
-        resumo_parts.append(t)
+        for pos_id, pos_name in POSICOES.items():
+            d = df_all[df_all["posicao_id"] == pos_id].copy()
+            if d.empty:
+                continue
+            t = d.sort_values(["previsao_pontos"], ascending=False).head(top_n_resumo).copy()
+            t.insert(0, "lista", f"{pos_name} - TOP {top_n_resumo} (Pontos)")
+            resumo_parts.append(t)
 
     df_resumo = pd.concat(resumo_parts, ignore_index=True) if resumo_parts else pd.DataFrame()
 
+    # =========================
+    # Partidas
+    # =========================
     df_matches = matches_to_df(odds_by_clube)
-    df_imp = importance_to_df(models, top_n=40)
 
-    sheet_by_pos = {1:"Goleiros",2:"Laterais",3:"Zagueiros",4:"Meias",5:"Atacantes",6:"Tecnicos"}
+    # =========================
+    # Importance (global + por posição)
+    # =========================
+    df_imp_rank_global = importance_to_df(models, top_n=40, kind="ranker", posicao_id=None)
+    df_imp_score_global = importance_to_df(models, top_n=40, kind="score", posicao_id=None)
 
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+    sheet_by_pos = SHEET_BY_POS
+
+    # =========================
+    # Escrita do Excel
+    # =========================
+    with pd.ExcelWriter(str(out_path), engine="openpyxl") as writer:
         if not df_resumo.empty:
             df_resumo.to_excel(writer, sheet_name="Resumo", index=False)
 
+        # Base
         df_all.to_excel(writer, sheet_name="Jogadores", index=False)
 
-        for pos_id, name in sheet_by_pos.items():
+        # Abas por posição (jogadores)
+        for pos_id, sheet_name in sheet_by_pos.items():
             d = df_all[df_all["posicao_id"] == pos_id].copy()
             if not d.empty:
-                d.to_excel(writer, sheet_name=name, index=False)
+                df_sheet = d
+                df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
 
+        # Partidas
         if not df_matches.empty:
             df_matches.to_excel(writer, sheet_name="Partidas", index=False)
-        if not df_imp.empty:
-            df_imp.to_excel(writer, sheet_name="Importance", index=False)
 
+        # Importance (global)
+        if df_imp_rank_global is not None and not df_imp_rank_global.empty:
+            df_imp_rank_global.to_excel(writer, sheet_name="Importance_Ranker", index=False)
+
+        if df_imp_score_global is not None and not df_imp_score_global.empty:
+            df_imp_score_global.to_excel(writer, sheet_name="Importance_Score", index=False)
+
+        # Importance (por posição)
+        for pos_id, sheet_name in sheet_by_pos.items():
+            df_r = importance_to_df(models, top_n=40, kind="ranker", posicao_id=pos_id)
+            df_s = importance_to_df(models, top_n=40, kind="score", posicao_id=pos_id)
+
+            if df_r is not None and not df_r.empty:
+                name_r = f"ImpR_{sheet_name}"
+                df_r.to_excel(writer, sheet_name=name_r[:31], index=False)  # Excel <= 31 chars
+
+            if df_s is not None and not df_s.empty:
+                name_s = f"ImpS_{sheet_name}"
+                df_s.to_excel(writer, sheet_name=name_s[:31], index=False)
+
+    # =========================
+    # Autoformatação
+    # =========================
     from openpyxl import load_workbook
-    wb = load_workbook(path)
+
+    wb = load_workbook(str(out_path))
     for sh in wb.sheetnames:
         ws = wb[sh]
         values = list(ws.values)
@@ -321,5 +439,5 @@ def save_excel(
         data = values[1:]
         df_tmp = pd.DataFrame(data, columns=cols)
         _autosize_and_format_sheet(ws, df_tmp)
-    wb.save(path)
 
+    wb.save(str(out_path))

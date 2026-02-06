@@ -32,15 +32,15 @@ class TemporalFeatureEngineer:
     
     def __init__(self, df: pd.DataFrame):
         LOGGER.info("Inicializando TemporalFeatureEngineer (otimizado v3)...")
-        
+
         self.df = df[df["entrou_em_campo"] == True].copy()
-        
+
         if "temporal_id" not in self.df.columns:
             raise ValueError(
                 "DataFrame precisa de coluna 'temporal_id'. "
                 "Use load_multi_year_data() ou load_historical_data() para carregar dados."
             )
-        
+
         # Converter tipos uma vez
         self.df["temporal_id"] = pd.to_numeric(self.df["temporal_id"], errors="coerce").fillna(0).astype(int)
         self.df["rodada_id"] = pd.to_numeric(self.df["rodada_id"], errors="coerce").fillna(0).astype(int)
@@ -48,7 +48,7 @@ class TemporalFeatureEngineer:
         self.df["opponent_id"] = pd.to_numeric(self.df["opponent_id"], errors="coerce").fillna(0).astype(int)
         self.df["posicao_id"] = pd.to_numeric(self.df["posicao_id"], errors="coerce").fillna(0).astype(int)
         self.df["clube_id"] = pd.to_numeric(self.df["clube_id"], errors="coerce").fillna(0).astype(int)
-        
+
         if "temporada" in self.df.columns:
             self.df["temporada"] = pd.to_numeric(self.df["temporada"], errors="coerce").fillna(0).astype(int)
 
@@ -57,174 +57,214 @@ class TemporalFeatureEngineer:
 
         # Ordenar por atleta e temporal_id para operações de janela
         self.df = self.df.sort_values(["atleta_id", "temporal_id"]).reset_index(drop=True)
-        
+
         # =====================================================================
         # ESTRUTURAS INDEXADAS PARA LOOKUP RÁPIDO
         # =====================================================================
-        
-        # 1. DataFrame indexado por (atleta_id, temporal_id)
+
         self._player_games_indexed = self.df.set_index(["atleta_id", "temporal_id"])
-        
-        # 2. Pré-calcular features de jogador usando operações vetorizadas
+
         LOGGER.info("   Pré-calculando features de jogador...")
         self._player_features_df = self._build_player_features_vectorized()
-        
-        # 3. Pré-calcular features de scout (se disponível)
+
         if self._has_scout_columns():
-            LOGGER.info("   Pré-calculando features de scout...")
             self._scout_features_df = self._build_scout_features_vectorized()
+
+            if self._scout_features_df is not None and not self._scout_features_df.empty:
+                self._player_features_df = (
+                    self._player_features_df
+                    .join(self._scout_features_df, how="left")
+                    .fillna(0.0)
+                )
+
+            self._opp_concedes_df = self._build_opp_concedes_features_vectorized()
         else:
             self._scout_features_df = None
-        
-        # 4. Pré-calcular agregados por time/posição
+            self._opp_concedes_df = None
+
         LOGGER.info("   Pré-calculando agregados por time/posição...")
         self._team_aggs = self._build_team_aggregates()
         self._pos_aggs = self._build_position_aggregates()
         self._pos_vs_opp_aggs = self._build_pos_vs_opp_aggregates()
-        
-        # 5. Caches para lookup rápido
+
         self._player_cache: Dict[Tuple[int, int], Dict] = {}
-        
+
         LOGGER.info(f"   ✓ TemporalFeatureEngineer inicializado: {len(self.df)} registros")
-    
+
+
     def _has_scout_columns(self) -> bool:
         """Verifica se há colunas de scout no DataFrame."""
         return any(col in self.df.columns for col in ALL_SCOUTS)
     
+    
     def _build_player_features_vectorized(self) -> pd.DataFrame:
         """
-        Constrói DataFrame de features de jogador usando operações VETORIZADAS.
-        
-        Evita iterrows() completamente.
+        Features do jogador (sem leakage: tudo usa shift(1)).
+
+        Volta a gerar:
+        - player_std, player_cv, player_last10_std
+        - player_form, player_consistency
+        - player_home_advantage
         """
-        # Agrupar por jogador
-        player_groups = self.df.groupby("atleta_id")
-        
-        # Calcular estatísticas por jogador com shift(1) para evitar leakage
+        player_groups = self.df.groupby("atleta_id", sort=False)
         features_list = []
-        
+
         for atleta_id, group in player_groups:
             group = group.sort_values("temporal_id")
-            
-            # Usar shift(1) em todas as features para evitar data leakage
-            # (a feature do temporal_id T usa apenas dados de T-1 e anteriores)
-            
-            # Pontuação acumulada com shift
-            pts = group["pontuacao"].astype(float)
-            
-            # Média móvel (últimos 5 jogos, sem o atual)
-            last5_mean = pts.shift(1).rolling(window=5, min_periods=1).mean()
-            
-            # Média geral (todos os jogos anteriores)
-            cumsum = pts.shift(1).cumsum()
-            cumcount = pd.Series(range(1, len(group) + 1), index=group.index)
-            cumcount_shifted = cumcount - 1
-            cumcount_shifted = cumcount_shifted.replace(0, np.nan)
-            player_mean = cumsum / cumcount_shifted
-            
-            # Std dos últimos 5
-            last5_std = pts.shift(1).rolling(window=5, min_periods=2).std().fillna(0)
-            
-            # Contagem de jogos (até o momento anterior)
-            games_count = cumcount_shifted.fillna(0).astype(int)
-            
-            # Tendência (diferença entre últimas 3 e anteriores 3)
-            last3 = pts.shift(1).rolling(window=3, min_periods=1).mean()
-            prev3 = pts.shift(4).rolling(window=3, min_periods=1).mean()
-            trend = (last3 - prev3).fillna(0)
-            
-            # Máximo e mínimo históricos
-            max_pts = pts.shift(1).expanding().max()
-            min_pts = pts.shift(1).expanding().min()
-            
-            # Streak de jogos positivos (pts > 0)
-            # Calculado de forma vetorizada
-            pts_positive = (pts.shift(1) > 0).astype(int)
+
+            pts = pd.to_numeric(group["pontuacao"], errors="coerce").fillna(0.0).astype(float)
+            pts_prev = pts.shift(1)
+
+            last5_mean = pts_prev.rolling(window=5, min_periods=1).mean()
+            last3_mean = pts_prev.rolling(window=3, min_periods=1).mean()
+            prev3_mean = pts.shift(4).rolling(window=3, min_periods=1).mean()
+
+            player_mean = pts_prev.expanding(min_periods=1).mean()
+
+            player_std = pts_prev.expanding(min_periods=2).std(ddof=0).fillna(0.0)
+            last5_std = pts_prev.rolling(window=5, min_periods=2).std(ddof=0).fillna(0.0)
+            last10_std = pts_prev.rolling(window=10, min_periods=2).std(ddof=0).fillna(0.0)
+
+            denom = player_mean.abs().replace(0.0, np.nan)
+            player_cv = (player_std / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            games_count = pts_prev.notna().cumsum().fillna(0).astype(int)
+            trend = (last3_mean - prev3_mean).fillna(0.0)
+
+            max_pts = pts_prev.expanding(min_periods=1).max().fillna(0.0)
+            min_pts = pts_prev.expanding(min_periods=1).min().fillna(0.0)
+
+            pts_positive = (pts_prev.fillna(0.0) > 0).astype(int)
             streak = pts_positive.groupby((pts_positive != pts_positive.shift()).cumsum()).cumcount() + 1
-            streak = streak * pts_positive  # Zero se não positivo
-            
-            # DataFrame com features por temporal_id
+            streak = (streak * pts_positive).fillna(0).astype(int)
+
+            is_home = group["is_home"].astype(bool)
+
+            home_pts_prev = pts.where(is_home).shift(1)
+            away_pts_prev = pts.where(~is_home).shift(1)
+
+            home_sum = home_pts_prev.fillna(0.0).cumsum()
+            away_sum = away_pts_prev.fillna(0.0).cumsum()
+
+            # garanta dtype boolean (nullable) antes de qualquer coisa
+            is_home = is_home.astype("boolean")
+
+            # evita NaN no shift sem precisar fillna em object
+            home_cnt = is_home.shift(1, fill_value=False).astype("int32").cumsum()
+            away_cnt = (~is_home).shift(1, fill_value=False).astype("int32").cumsum()
+
+            home_mean = (home_sum / home_cnt.replace(0, np.nan)).fillna(0.0)
+            away_mean = (away_sum / away_cnt.replace(0, np.nan)).fillna(0.0)
+            home_adv = (home_mean - away_mean).fillna(0.0)
+
+            player_form = (last5_mean - player_mean).fillna(0.0)
+            player_consistency = (1.0 / (1.0 + player_std)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
             player_df = pd.DataFrame({
                 "atleta_id": atleta_id,
                 "temporal_id": group["temporal_id"].values,
+
                 "player_mean": player_mean.values,
+                "player_std": player_std.values,
+                "player_cv": player_cv.values,
+
                 "player_last5_mean": last5_mean.values,
                 "player_last5_std": last5_std.values,
+                "player_last10_std": last10_std.values,
+
                 "player_games": games_count.values,
                 "player_trend": trend.values,
+
+                "player_form": player_form.values,
+                "player_consistency": player_consistency.values,
+                "player_home_advantage": home_adv.values,
+
                 "player_max": max_pts.values,
                 "player_min": min_pts.values,
                 "player_streak": streak.values,
             })
-            
+
             features_list.append(player_df)
-        
+
         if not features_list:
             return pd.DataFrame()
-        
+
         result = pd.concat(features_list, ignore_index=True)
-        # Indexar por (atleta_id, temporal_id) para lookup O(1)
-        result = result.set_index(["atleta_id", "temporal_id"])
-        
-        return result
-    
+        return result.set_index(["atleta_id", "temporal_id"])
+
+
     def _build_scout_features_vectorized(self) -> pd.DataFrame:
         """
-        Constrói DataFrame de features de scout usando operações VETORIZADAS.
+        Features de scout no formato do modelo antigo:
+        - scout_<SCOUT>_avg: média last5 com shift(1)
+        - scout_positive_ratio: (positivos last5) / (positivos+negativos last5)
         """
         scout_cols = [c for c in ALL_SCOUTS if c in self.df.columns]
         if not scout_cols:
             return pd.DataFrame()
-        
-        player_groups = self.df.groupby("atleta_id")
+
+        player_groups = self.df.groupby("atleta_id", sort=False)
         features_list = []
-        
+
+        pos_scouts = [s for s in POSITIVE_SCOUTS if s in self.df.columns]
+        neg_scouts = [s for s in NEGATIVE_SCOUTS if s in self.df.columns]
+
         for atleta_id, group in player_groups:
             group = group.sort_values("temporal_id")
-            
-            scout_features = {"atleta_id": atleta_id, "temporal_id": group["temporal_id"].values}
-            
+            out = {"atleta_id": atleta_id, "temporal_id": group["temporal_id"].values}
+
             for scout in scout_cols:
-                if scout not in group.columns:
-                    continue
-                    
-                vals = pd.to_numeric(group[scout], errors="coerce").fillna(0).astype(float)
-                
-                # Média dos últimos 5 (com shift para evitar leakage)
-                scout_features[f"scout_{scout}_last5_mean"] = (
-                    vals.shift(1).rolling(window=5, min_periods=1).mean().values
-                )
-                
-                # Total acumulado
-                scout_features[f"scout_{scout}_total"] = vals.shift(1).cumsum().values
-            
-            # Scouts positivos e negativos agregados
-            pos_scouts = [s for s in POSITIVE_SCOUTS if s in group.columns]
-            neg_scouts = [s for s in NEGATIVE_SCOUTS if s in group.columns]
-            
+                vals = pd.to_numeric(group[scout], errors="coerce").fillna(0.0).astype(float)
+                out[f"scout_{scout}_avg"] = vals.shift(1).rolling(window=5, min_periods=1).mean().values
+
             if pos_scouts:
-                pos_sum = group[pos_scouts].sum(axis=1).astype(float)
-                scout_features["scouts_positive_last5"] = (
-                    pos_sum.shift(1).rolling(window=5, min_periods=1).sum().values
-                )
-            
+                pos_sum = group[pos_scouts].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1).astype(float)
+                pos_last5 = pos_sum.shift(1).rolling(window=5, min_periods=1).sum()
+            else:
+                pos_last5 = pd.Series(0.0, index=group.index)
+
             if neg_scouts:
-                neg_sum = group[neg_scouts].sum(axis=1).astype(float)
-                scout_features["scouts_negative_last5"] = (
-                    neg_sum.shift(1).rolling(window=5, min_periods=1).sum().values
-                )
-            
-            player_df = pd.DataFrame(scout_features)
-            features_list.append(player_df)
-        
+                neg_sum = group[neg_scouts].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1).astype(float)
+                neg_last5 = neg_sum.shift(1).rolling(window=5, min_periods=1).sum()
+            else:
+                neg_last5 = pd.Series(0.0, index=group.index)
+
+            denom = (pos_last5 + neg_last5).replace(0.0, np.nan)
+            ratio = (pos_last5 / denom).fillna(0.0).clip(0.0, 1.0)
+
+            out["scout_positive_ratio"] = ratio.values
+            features_list.append(pd.DataFrame(out))
+
         if not features_list:
             return pd.DataFrame()
-        
+
         result = pd.concat(features_list, ignore_index=True)
-        result = result.set_index(["atleta_id", "temporal_id"])
-        
-        return result
-    
+        return result.set_index(["atleta_id", "temporal_id"])
+
+    def _build_opp_concedes_features_vectorized(self) -> Optional[pd.DataFrame]:
+        """
+        Constrói (opponent_id, temporal_id) -> opp_concedes_<SCOUT>
+        Usando a produção média de scouts dos jogadores que enfrentaram o oponente,
+        com rolling last5 e shift(1) (sem leakage).
+        """
+        scout_cols = [c for c in ALL_SCOUTS if c in self.df.columns]
+        if not scout_cols:
+            return None
+
+        opp_round = (
+            self.df.groupby(["opponent_id", "temporal_id"], sort=True)[scout_cols]
+            .mean()
+            .sort_index()
+        )
+
+        def _roll(g: pd.DataFrame) -> pd.DataFrame:
+            return g.shift(1).rolling(window=5, min_periods=1).mean()
+
+        rolled = opp_round.groupby(level=0, group_keys=False).apply(_roll).fillna(0.0)
+        rolled = rolled.rename(columns={c: f"opp_concedes_{c}" for c in scout_cols})
+        return rolled
+
+
     def _build_team_aggregates(self) -> Dict[Tuple[int, int], Dict[str, float]]:
         """
         Constrói agregados por time usando operações vetorizadas.
@@ -266,6 +306,7 @@ class TemporalFeatureEngineer:
                 }
         
         return team_aggs
+    
     
     def _build_position_aggregates(self) -> Dict[Tuple[int, int], Dict[str, float]]:
         """
@@ -326,78 +367,141 @@ class TemporalFeatureEngineer:
     
     def _get_player_features(self, atleta_id: int, temporal_id: int) -> Dict[str, float]:
         """
-        Obtém features de jogador via lookup indexado O(1).
-        
-        CORREÇÃO: Usa .loc com índice em vez de iteração.
+        Obtém features de jogador por lookup (atleta_id, temporal_id).
+
+        Correção: se não existir o temporal_id (ex.: rodada futura sem histórico),
+        faz fallback para o último temporal_id anterior disponível para esse atleta.
         """
-        # Verificar cache primeiro
         cache_key = (atleta_id, temporal_id)
         if cache_key in self._player_cache:
             return self._player_cache[cache_key]
-        
-        result = {}
-        
-        # Lookup no DataFrame indexado
-        try:
-            row = self._player_features_df.loc[(atleta_id, temporal_id)]
+
+        def _row_to_dict(row) -> Dict[str, float]:
+            out = {}
             for col in row.index:
                 val = row[col]
-                # CORREÇÃO: Checagem apropriada de NaN
-                if pd.isna(val):
-                    result[col] = 0.0
-                else:
-                    result[col] = float(val)
+                out[col] = 0.0 if pd.isna(val) else float(val)
+            return out
+
+        # 1) tenta exato
+        try:
+            row = self._player_features_df.loc[(atleta_id, temporal_id)]
+            result = _row_to_dict(row)
+            self._player_cache[cache_key] = result
+            return result
         except KeyError:
-            # Jogador/temporal_id não encontrado - retornar zeros
-            result = {
-                "player_mean": 0.0,
-                "player_last5_mean": 0.0,
-                "player_last5_std": 0.0,
-                "player_games": 0,
-                "player_trend": 0.0,
-                "player_max": 0.0,
-                "player_min": 0.0,
-                "player_streak": 0,
-            }
-        
-        # Adicionar features de scout se disponível
-        if self._scout_features_df is not None:
+            pass
+
+        # 2) fallback: procura para trás
+        t = temporal_id - 1
+        while t > 0:
             try:
-                scout_row = self._scout_features_df.loc[(atleta_id, temporal_id)]
-                for col in scout_row.index:
-                    val = scout_row[col]
-                    if pd.isna(val):
-                        result[col] = 0.0
-                    else:
-                        result[col] = float(val)
+                row = self._player_features_df.loc[(atleta_id, t)]
+                result = _row_to_dict(row)
+                self._player_cache[cache_key] = result
+                return result
             except KeyError:
-                pass
-        
-        # Cache para reutilização
+                t -= 1
+
+        # 3) nada encontrado
+        result = {
+            "player_mean": 0.0,
+            "player_last5_mean": 0.0,
+            "player_last5_std": 0.0,
+            "player_games": 0.0,
+            "player_trend": 0.0,
+            "player_max": 0.0,
+            "player_min": 0.0,
+            "player_streak": 0.0,
+        }
         self._player_cache[cache_key] = result
-        
         return result
-    
+
+
     def _get_team_features(self, clube_id: int, temporal_id: int) -> Dict[str, float]:
-        """Obtém features de time via lookup O(1)."""
-        return self._team_aggs.get((clube_id, temporal_id), {
-            "team_avg": 0.0,
-            "team_std": 0.0,
-            "team_last5_avg": 0.0,
-        })
-    
+        """Features de time com fallback para o último temporal_id disponível."""
+        if not hasattr(self, "_team_cache"):
+            self._team_cache = {}
+
+        key = (clube_id, temporal_id)
+        if key in self._team_cache:
+            return self._team_cache[key]
+
+        v = self._team_aggs.get(key)
+        if v is not None:
+            self._team_cache[key] = v
+            return v
+
+        t = temporal_id - 1
+        while t > 0:
+            k2 = (clube_id, t)
+            v2 = self._team_aggs.get(k2)
+            if v2 is not None:
+                self._team_cache[key] = v2
+                return v2
+            t -= 1
+
+        d = {"team_avg": 0.0, "team_std": 0.0, "team_last5_avg": 0.0}
+        self._team_cache[key] = d
+        return d
+
+
     def _get_position_features(self, posicao_id: int, temporal_id: int) -> Dict[str, float]:
-        """Obtém features de posição via lookup O(1)."""
-        return self._pos_aggs.get((posicao_id, temporal_id), {"pos_avg": 0.0})
-    
-    def _get_pos_vs_opp_features(
-        self, posicao_id: int, opponent_id: int, temporal_id: int
-    ) -> Dict[str, float]:
-        """Obtém features de posição vs oponente via lookup O(1)."""
-        return self._pos_vs_opp_aggs.get((posicao_id, opponent_id, temporal_id), {
-            "pos_vs_opp_mean": 0.0,
-        })
-    
+        """Features de posição com fallback para o último temporal_id disponível."""
+        if not hasattr(self, "_pos_cache"):
+            self._pos_cache = {}
+
+        key = (posicao_id, temporal_id)
+        if key in self._pos_cache:
+            return self._pos_cache[key]
+
+        v = self._pos_aggs.get(key)
+        if v is not None:
+            self._pos_cache[key] = v
+            return v
+
+        t = temporal_id - 1
+        while t > 0:
+            k2 = (posicao_id, t)
+            v2 = self._pos_aggs.get(k2)
+            if v2 is not None:
+                self._pos_cache[key] = v2
+                return v2
+            t -= 1
+
+        d = {"pos_avg": 0.0}
+        self._pos_cache[key] = d
+        return d
+
+
+    def _get_pos_vs_opp_features(self, posicao_id: int, opponent_id: int, temporal_id: int) -> Dict[str, float]:
+        """Features posição vs oponente com fallback para o último temporal_id disponível."""
+        if not hasattr(self, "_pos_opp_cache"):
+            self._pos_opp_cache = {}
+
+        key = (posicao_id, opponent_id, temporal_id)
+        if key in self._pos_opp_cache:
+            return self._pos_opp_cache[key]
+
+        v = self._pos_vs_opp_aggs.get(key)
+        if v is not None:
+            self._pos_opp_cache[key] = v
+            return v
+
+        t = temporal_id - 1
+        while t > 0:
+            k2 = (posicao_id, opponent_id, t)
+            v2 = self._pos_vs_opp_aggs.get(k2)
+            if v2 is not None:
+                self._pos_opp_cache[key] = v2
+                return v2
+            t -= 1
+
+        d = {"pos_vs_opp_mean": 0.0}
+        self._pos_opp_cache[key] = d
+        return d
+
+
     def _get_match_features(self, match_odds: MatchOdds, is_home: bool) -> Dict[str, float]:
         """Extrai features do confronto (odds)."""
         if match_odds is None:
@@ -452,46 +556,70 @@ class TemporalFeatureEngineer:
         is_home: bool,
         temporal_id: int,
     ) -> Dict[str, float]:
-        """
-        Calcula todas as features para um jogador em uma rodada.
-        
-        Usa lookups indexados O(1) para todas as consultas.
-        """
-        features = {}
-        
-        # 1. Features do jogador
-        player_feats = self._get_player_features(atleta_id, temporal_id)
-        features.update(player_feats)
-        
-        # 2. Features do time
-        team_feats = self._get_team_features(clube_id, temporal_id)
-        features.update(team_feats)
-        
-        # 3. Features da posição
-        pos_feats = self._get_position_features(posicao_id, temporal_id)
-        features.update(pos_feats)
-        
-        # 4. Features de posição vs oponente
-        pos_vs_opp_feats = self._get_pos_vs_opp_features(posicao_id, opponent_id, temporal_id)
-        features.update(pos_vs_opp_feats)
-        
-        # 5. Features do confronto (odds)
+        features: Dict[str, float] = {}
+
+        # jogador + scouts (já entram em _get_player_features)
+        features.update(self._get_player_features(atleta_id, temporal_id))
+
+        # time/posição/pos_vs_opp
+        features.update(self._get_team_features(clube_id, temporal_id))
+        features.update(self._get_position_features(posicao_id, temporal_id))
+        features.update(self._get_pos_vs_opp_features(posicao_id, opponent_id, temporal_id))
+
+        # confronto
         match_feats = self._get_match_features(match_odds, is_home)
         features.update(match_feats)
-        
-        # 6. Features de identificação
+
+        # nome antigo (OLDMODEL)
+        if "p_team_scores" in match_feats:
+            features["p_team_scores_1plus"] = float(match_feats["p_team_scores"])
+
+        # opp_concedes_*
+        if getattr(self, "_opp_concedes_df", None) is not None:
+            try:
+                row = self._opp_concedes_df.loc[(opponent_id, temporal_id)]
+                for col in row.index:
+                    v = row[col]
+                    features[col] = 0.0 if pd.isna(v) else float(v)
+            except KeyError:
+                pass
+
+        # === Perfis/interações do modelo antigo ===
+        g_avg = float(features.get("scout_G_avg", 0.0))
+        shots_avg = float(features.get("scout_FD_avg", 0.0)) + float(features.get("scout_FF_avg", 0.0)) + float(features.get("scout_FT_avg", 0.0))
+
+        if posicao_id in (4, 5):  # meia/atacante
+            profile_finisher = float(np.clip(g_avg / (shots_avg + 0.20), 0.0, 1.0))
+        else:
+            profile_finisher = 0.0
+
+        profile_defender = 1.0 if posicao_id in (1, 2, 3, 6) else 0.0
+
+        team_xg = float(features.get("team_xG", 0.0))
+        opp_xg = float(features.get("opp_xG", 0.0))
+        opp_concedes_g = float(features.get("opp_concedes_G", opp_xg))
+
+        features["profile_finisher"] = profile_finisher
+        features["profile_defender"] = profile_defender
+        features["player_x_xG"] = float(profile_finisher * team_xg)
+        features["finisher_x_opp_goals"] = float(profile_finisher * opp_concedes_g)
+        features["home_x_player_home"] = float((1.0 if is_home else 0.0) * float(features.get("player_home_advantage", 0.0)))
+
         features["posicao_id"] = float(posicao_id)
-        
-        # Garantir que não há NaN nos features finais
-        for k, v in features.items():
-            # CORREÇÃO: Checagem apropriada
-            if v is None or pd.isna(v):
+
+        # sanitização
+        for k, v in list(features.items()):
+            if v is None or pd.isna(v) or np.isinf(v):
                 features[k] = 0.0
-            elif np.isinf(v):
-                features[k] = 0.0
-        
+            else:
+                try:
+                    features[k] = float(v)
+                except Exception:
+                    features[k] = 0.0
+
         return features
-    
+
+
     def get_historical_features(
         self,
         atleta_id: int,

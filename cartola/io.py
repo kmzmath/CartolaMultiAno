@@ -24,7 +24,9 @@ from .config import (
     SEASON_BASE_YEAR,
     ROUNDS_PER_SEASON,
     calculate_temporal_id,
+    ALL_SCOUTS
 )
+
 # -----------------------------------------------------------------------------
 # Temporal ID defaults (para suportar multi-ano mesmo antes de migrar config.py)
 # -----------------------------------------------------------------------------
@@ -296,6 +298,23 @@ class MatchOdds:
 
         self.lambda_home, self.lambda_away = PoissonModel.fit_lambdas(self.p_home, self.p_draw, self.p_away)
 
+
+    # --- compatibilidade com versões antigas do features.py ---
+    @property
+    def home_xG(self) -> float:
+        return float(self.lambda_home)
+
+    @property
+    def away_xG(self) -> float:
+        return float(self.lambda_away)
+
+    def p_home_scores(self, k: int) -> float:
+        return float(PoissonModel.poisson_prob(self.lambda_home, int(k)))
+
+    def p_away_scores(self, k: int) -> float:
+        return float(PoissonModel.poisson_prob(self.lambda_away, int(k)))
+
+
     def get_xg_features(self, is_home: bool) -> Dict[str, float]:
         if is_home:
             team_xg, opp_xg = self.lambda_home, self.lambda_away
@@ -420,55 +439,59 @@ class CartolaAPI:
 def _process_dataframe(df: pd.DataFrame, source_season: Optional[int] = None) -> pd.DataFrame:
     """
     Processa um DataFrame adicionando colunas temporada e temporal_id.
-    
-    Args:
-        df: DataFrame com dados de jogadores
-        source_season: Temporada conhecida (do nome do arquivo). 
-                       Se None, tenta extrair do partida_id.
-    
-    Returns:
-        DataFrame processado com colunas temporada e temporal_id
+    Também expande scout_json -> colunas (ALL_SCOUTS) para permitir
+    features do tipo scout_* e opp_concedes_* (modelo antigo).
     """
     df = df.copy()
-    
+
     # Converter colunas básicas
     df["rodada_id"] = df["rodada_id"].apply(safe_int)
     df["atleta_id"] = df["atleta_id"].apply(safe_int)
     df["posicao_id"] = df["posicao_id"].apply(safe_int)
     df["clube_id"] = df["clube_id"].apply(safe_int)
     df["opponent_id"] = df["opponent_id"].apply(safe_int)
-    
+
     df["pontuacao"] = pd.to_numeric(df["pontuacao"], errors="coerce").fillna(0.0)
     df["entrou_em_campo"] = df["entrou_em_campo"].apply(parse_bool)
     df["is_home"] = df["is_home"].apply(parse_bool)
-    
+
     df["p_team_win"] = pd.to_numeric(df["p_team_win"], errors="coerce")
     df["p_draw"] = pd.to_numeric(df["p_draw"], errors="coerce")
     df["p_team_lose"] = pd.to_numeric(df["p_team_lose"], errors="coerce")
-    
+
+    # Scout dict
     df["scout_dict"] = df["scout_json"].apply(parse_scout_json)
-    
+
+    # === IMPORTANTE: explodir scouts em colunas (vetorizado) ===
+    scouts_df = pd.json_normalize(df["scout_dict"])
+    if scouts_df is None or scouts_df.empty:
+        # garantir colunas
+        for s in ALL_SCOUTS:
+            df[s] = 0.0
+    else:
+        scouts_df = scouts_df.reindex(columns=ALL_SCOUTS).fillna(0.0)
+        scouts_df = scouts_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
+        df = pd.concat([df, scouts_df], axis=1)
+
     # Extrair temporada
     if source_season is not None:
-        # Temporada conhecida pelo nome do arquivo
         df["temporada"] = source_season
     elif "partida_id" in df.columns:
-        # Tentar extrair do partida_id
         df["temporada"] = df["partida_id"].apply(extract_season_from_partida_id)
-        # Preencher valores faltantes com fallback
         if df["temporada"].isna().any():
-            # Tentar inferir do contexto ou usar valor padrão
             valid_seasons = df["temporada"].dropna().unique()
             if len(valid_seasons) == 1:
                 df["temporada"] = df["temporada"].fillna(valid_seasons[0])
             else:
                 LOGGER.warning("Algumas linhas não têm temporada identificável no partida_id")
     else:
-        raise ValueError("Não foi possível identificar a temporada. "
-                        "Forneça source_season ou inclua partida_id no CSV.")
-    
+        raise ValueError(
+            "Não foi possível identificar a temporada. "
+            "Forneça source_season ou inclua partida_id no CSV."
+        )
+
     df["temporada"] = df["temporada"].apply(safe_int)
-    
+
     # Calcular temporal_id
     def _calc_temporal_id(row):
         temporada = safe_int(row.get("temporada"))
@@ -476,9 +499,9 @@ def _process_dataframe(df: pd.DataFrame, source_season: Optional[int] = None) ->
         if temporada is None or rodada_id is None:
             return None
         return calculate_temporal_id(temporada, rodada_id)
-    
+
     df["temporal_id"] = df.apply(_calc_temporal_id, axis=1)
-    
+
     return df
 
 
@@ -689,24 +712,23 @@ def load_odds(
 def save_models(models, fe, filepath: str = "cartola_models.pkl"):
     """
     Salva os modelos treinados e o feature engineer em um arquivo pickle.
-    
-    Args:
-        models: PositionModels treinado
-        fe: TemporalFeatureEngineer com dados históricos
-        filepath: caminho do arquivo para salvar
     """
     save_data = {
         "models": models,
         "fe": fe,
         "timestamp": datetime.now().isoformat(),
-        "version": "3.1-multiyear"
+        "version": "3.1-multiyear",
     }
-    
-    with open(filepath, "wb") as f:
+
+    path = Path(filepath)
+    if path.parent and str(path.parent) not in ("", "."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "wb") as f:
         pickle.dump(save_data, f)
-    
-    LOGGER.info(f"✓ Modelos salvos em: {filepath}")
-    print(f"✓ Modelos salvos em: {filepath}")
+
+    LOGGER.info(f"✓ Modelos salvos em: {path}")
+    print(f"✓ Modelos salvos em: {path}")
     
 
 def load_models(filepath: str = "cartola_models.pkl"):

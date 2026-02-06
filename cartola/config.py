@@ -145,13 +145,20 @@ POISSON_MAX_GOALS = 10
 # PATHS
 # =============================================================================
 
-def get_default_paths():
-    """Retorna caminhos padrão para arquivos."""
+def get_default_paths(base_dir: str | None = None):
+    """Retorna caminhos padrão para os arquivos."""
     import os
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    if base_dir is None:
+        base_dir = os.getcwd()
+
+    base_dir = os.path.abspath(base_dir)
+
     return {
-        "model_path": os.path.join(base, "models", "cartola_models.pkl"),
-        "output_path": os.path.join(base, "output", "cartola_predictions.xlsx"),
-        "log_path": os.path.join(base, "logs", "cartola.log"),
-        "data_dir": os.path.join(base, "data"),
+        "csv": os.path.join(base_dir, "player_games_with_odds.csv"),
+        "csv_pattern": os.path.join(base_dir, "player_games_with_odds_*.csv"),
+        "odds": os.path.join(base_dir, "OddsCasas.txt"),
+        "output": os.path.join(base_dir, "output", "cartola_predictions.xlsx"),
+        "models": os.path.join(base_dir, "models", "cartola_models.pkl"),
+        "logs_dir": os.path.join(base_dir, "logs"),
     }

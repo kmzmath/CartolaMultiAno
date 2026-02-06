@@ -130,7 +130,7 @@ def main():
     print("=" * 100)
     print(" 🏆 CARTOLA FC - Ranking Edition v3.1 - MULTI-TEMPORADA")
     print(" ✓ Suporte a múltiplas temporadas | temporal_id contínuo")
-    print(" ✓ Validação dura | Sem vazamento | CV temporal | Ranker | p10/p90 + cobertura")
+    print(" ✓ Validação dura | Sem vazamento | CV temporal | Ranker | p10/p90")
     print("=" * 100)
 
     script_dir = (
@@ -309,8 +309,19 @@ def main():
     bt_results = bt.run(start_bt, max_tid, global_params=global_params, k_pos=k_pos, rank_by="score")
     print_backtest(bt_results, k_pos=k_pos)
 
+    # main.py — substitua a chamada do build_and_train por esta
+
     optimize_global = (global_params is None)
-    models = build_and_train(df, fe, optimize_global=optimize_global, global_params=global_params)
+    models = build_and_train(
+        df, fe,
+        optimize_global=optimize_global,
+        global_params=global_params,
+        optimize_by_pos=True,
+        optuna_trials_by_pos=150,          # ajuste conforme tempo/qualidade
+        optimize_regressor_by_pos=True,    # para previsao_pontos também ser “por posição”
+        optuna_trials_reg_by_pos=120,      # ajuste conforme tempo/qualidade
+    )
+
 
     # Salvar modelos
     save_models(models, fe, model_path)
@@ -323,7 +334,7 @@ def main():
 
     # Previsões
     print(f"\n🔮 Gerando previsões (rodada {rodada_atual}, temporada {temporada})...")
-    preds = generate_predictions(api, models, fe, odds_by_clube, atletas, rodada_atual, temporada)
+    preds = generate_predictions(api, models, fe, odds_by_clube, provaveis, rodada_atual, temporada)
     LOGGER.info(f"Previsões geradas: {len(preds)} jogadores")
     print(f"   ✓ {len(preds)} jogadores previstos")
 
